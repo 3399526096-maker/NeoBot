@@ -1,4 +1,4 @@
-"""Detect a manually updated workspace version without modifying project files."""
+"""Decide whether the workspace version needs publishing; never modify project files."""
 from __future__ import annotations
 
 import argparse
@@ -130,16 +130,18 @@ def previous_version(root: Path, base_ref: str) -> Version:
         raise ReleaseError(f"Cannot read baseline {base_ref}: {exc}") from exc
 
 
-def prepare_release(root: Path, *, base_ref: str) -> ReleasePlan:
+def prepare_release(root: Path, *, base_ref: str | None) -> ReleasePlan:
+    """Compare against a Git baseline; base_ref=None (manual runs) decides from PyPI alone."""
     root = Path(root)
     projects = load_projects(root)
     local = projects[0].version
     version = projects[0].raw_version
-    previous = previous_version(root, base_ref)
-    if local == previous:
-        return ReleasePlan(version, False, "Version unchanged")
-    if local < previous:
-        raise ReleaseError(f"Version must increase manually: {previous} -> {version}")
+    if base_ref is not None:
+        previous = previous_version(root, base_ref)
+        if local == previous:
+            return ReleasePlan(version, False, "Version unchanged")
+        if local < previous:
+            raise ReleaseError(f"Version must increase manually: {previous} -> {version}")
     publishable = [project for project in projects if project.publishable]
     if not publishable:
         raise ReleaseError("No publishable workspace packages")
@@ -149,6 +151,8 @@ def prepare_release(root: Path, *, base_ref: str) -> ReleasePlan:
             raise ReleaseError(f"{project.name}: {version} is older than PyPI {max(published)}; update versions manually")
     if all(local in published for _, published in histories):
         return ReleasePlan(version, False, "Version already published for all packages")
+    if base_ref is None:
+        return ReleasePlan(version, True, "PyPI is missing the current version")
     return ReleasePlan(version, True, "Manual version update detected")
 
 
@@ -157,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--base-ref", help="Git ref before the push (github.event.before)")
+    mode.add_argument(
+        "--publish-missing", action="store_true",
+        help="Ignore the Git baseline: publish the current versions that PyPI is missing (manual runs)",
+    )
     mode.add_argument("--check-only", action="store_true", help="Validate local versions without Git or PyPI access")
     args = parser.parse_args(argv)
     try:

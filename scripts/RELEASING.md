@@ -3,7 +3,7 @@
 ## GitHub Actions
 
 - `.github/workflows/ci.yml`：PR 的 Python 静态检查/测试、前端 lint/类型/测试/构建及入库产物一致性检查；同时可由发布工作流复用。
-- `.github/workflows/publish.yml`：main 推送后通过 GitHub API 确认该提交来自合并 PR，直接推送不发布。对合并提交重新运行 CI，通过后才检测版本、构建和上传。
+- `.github/workflows/publish.yml`：main 推送后通过 GitHub API 确认该提交来自合并 PR，直接推送不发布。也可在 Actions 页面手动对 main 触发（`workflow_dispatch`）：手动触发是对 main 的显式发布动作，仅当 ref 就是 main 时才可信，从其他分支手动触发一律跳过。两种情况都会先重跑 CI，通过后才检测版本、构建和上传。
 - CI 和发布流程只读检查源码版本及锁文件，不自动改版本、不更新锁文件，也不提交或推送代码；无需 main 写权限。
 
 ### 首次配置
@@ -36,16 +36,17 @@
 
 ### 版本检测与上传
 
-`scripts/prepare_release.py --base-ref <推送前的提交>` 比较根项目当前版本与推送前版本；GitHub Actions 传入 `github.event.before`。脚本只检测，不修改任何项目文件，并通过 `GITHUB_OUTPUT` 输出原始 SemVer `version` 和 `publish=true/false`。
+`scripts/prepare_release.py --base-ref <推送前的提交>` 比较根项目当前版本与推送前版本；推送时 GitHub Actions 传入 `github.event.before`。手动触发没有该值：留空表单时改用 `--publish-missing`，完全忽略 Git 基线，只按 PyPI 判断（7 个包缺当前版本就发布，全部已有则跳过）；确实需要按某条历史提交比较时，再在触发表单里填写 `base_ref`（提交 SHA 或 tag）。脚本只检测，不修改任何项目文件，并通过 `GITHUB_OUTPUT` 输出原始 SemVer `version` 和 `publish=true/false`。
 
 - 先校验全部工作区版本的 SemVer 格式及 PyPI 兼容性；任一非法都会报错停止，不查询 PyPI、不上传，即使版本未变也不放行。PyPI 历史版本和 Git 基线仅作 PEP 440 比较，允许历史的规范化拼写。
-- 根版本未变：不查询 PyPI，输出 `publish=false`；跳过发布凭据检查、发布 job 的 Node/pnpm 安装、构建和上传，合并 PR 的 CI 门禁仍运行。
+- 根版本未变（推送或显式填了 `base_ref` 时才会比较）：不查询 PyPI，输出 `publish=false`；跳过发布凭据检查、发布 job 的 Node/pnpm 安装、构建和上传，合并 PR 的 CI 门禁仍运行。
+- 手动触发且留空 `base_ref`：跳过 Git 基线比较，直接看 PyPI——7 个包都已有当前版本则 `publish=false`，缺任意一个则 `publish=true` 补齐发布（适合重发一个已合并、但当时发布失败的版本）。
 - 根版本有变：要求 8 个项目版本一致，且相较推送前版本递增；手动目标版本若低于 PyPI 已有版本也会失败。校验失败立即中止。所有版本均由维护者手动选择，脚本不会自动递增。
 - PyPI 已有全部 7 个包的当前版本：输出 `publish=false`，跳过上传。部分包缺失当前版本：输出 `publish=true`，构建并补齐发布；`uv publish --check-url` 跳过已存在的文件。
 - PyPI 的 PEP 440 规范化仅用于版本比较和构建/发布，例如 `1.0.0-alpha.23` 对应 `1.0.0a23`；不会回写或改变仓库中的 SemVer 拼写。
 - PyPI 只有 404 视为新包；网络错误、鉴权/服务错误或无效响应均中止，不猜测版本。
 
-若上传部分失败，且仍有包缺失当前版本，可重跑该版本变更对应的工作流补齐发布。若所有包的当前版本均已建立，但个别 wheel/sdist 文件缺失，自动流程会跳过，需使用下方本地 `publish.ps1` 补齐同一版本的文件。后续无版本变更的 PR 不会触发补发。不要用旧版本运行覆盖新发布；多个 main 推送的等待运行仍受 GitHub concurrency 队列规则影响。
+若上传部分失败，且仍有包缺失当前版本，可重跑该版本变更对应的工作流，或在 Actions 页面手动对 main 触发补齐发布：留空 `base_ref` 即按 PyPI 缺失情况补发，不需要知道版本变更提交是哪一个。若所有包的当前版本均已建立，但个别 wheel/sdist 文件缺失，自动流程会跳过，需使用下方本地 `publish.ps1` 补齐同一版本的文件。后续无版本变更的 PR 不会触发补发。不要用旧版本运行覆盖新发布；多个 main 推送的等待运行仍受 GitHub concurrency 队列规则影响。
 
 ## 本地发布
 

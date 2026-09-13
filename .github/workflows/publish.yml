@@ -3,6 +3,11 @@ name: Publish to PyPI
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: false
+        type: string
 
 # Never cancel a release while it is uploading multiple workspace packages.
 concurrency:
@@ -14,7 +19,7 @@ permissions:
 
 jobs:
   merged-pr:
-    name: 确认 main 推送来自已合并 PR
+    name: 确认发布来源可信（已合并 PR 或 main 手动触发）
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,10 +29,16 @@ jobs:
     steps:
       # Use push rather than pull_request.closed so merged fork PRs also receive
       # the trusted main-branch token/secrets. Direct pushes do not publish.
+      # 手动触发是对 main 的显式动作：只有 ref 确为 main 时才视为可信，
+      # 其他分支的手动触发一律跳过发布。
       - uses: actions/github-script@v8
         id: pr
         with:
           script: |
+            if (context.eventName === 'workflow_dispatch') {
+              core.setOutput('merged', String(context.ref === 'refs/heads/main'));
+              return;
+            }
             const prs = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
               ...context.repo,
               commit_sha: context.sha,
@@ -59,7 +70,21 @@ jobs:
 
       - name: 检测版本更新
         id: version
-        run: uv run --no-project --python 3.13 --with packaging python scripts/prepare_release.py --base-ref "${{ github.event.before }}"
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          INPUT_BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          if [ -n "$EVENT_BEFORE" ]; then
+            ARGS=(--base-ref "$EVENT_BEFORE")
+          elif [ -n "$INPUT_BASE_REF" ]; then
+            ARGS=(--base-ref "$INPUT_BASE_REF")
+          else
+            # 手动触发没有 github.event.before：默认不看 Git 基线，
+            # 只把 main 当前版本里 PyPI 还缺的包补齐。
+            ARGS=(--publish-missing)
+          fi
+          echo "prepare_release ${ARGS[*]}"
+          uv run --no-project --python 3.13 --with packaging python scripts/prepare_release.py "${ARGS[@]}"
 
       - name: 检查发布凭据
         if: steps.version.outputs.publish == 'true'
