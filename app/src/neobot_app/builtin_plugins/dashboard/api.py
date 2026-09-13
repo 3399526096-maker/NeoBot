@@ -73,6 +73,20 @@ def _json_error(message: str, *, status: int = 400, **extra: Any) -> web.Respons
     return web.json_response(payload, status=status)
 
 
+def _parse_cost_detail(raw: Any) -> dict[str, Any] | None:
+    """把 cost_detail 的单行 JSON 解析回 {components, note}（解析失败返回原始文本）。"""
+    if raw is None:
+        return None
+    text = str(raw)
+    if not text.strip():
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {"raw": text}
+    return parsed if isinstance(parsed, dict) else {"raw": text}
+
+
 def _redact_prompt_report(report: dict[str, Any]) -> dict[str, Any]:
     """非管理会话只保留统计：系统提示词原文与工具 schema 不整段外发。"""
     redacted = dict(report)
@@ -502,6 +516,250 @@ class DashboardApi:
         return _json_ok({"available": True, "hours": hours, "totals": totals, "items": items})
 
     # ------------------------------------------------------------------
+    # 计费（spec(4) Part A）
+    # ------------------------------------------------------------------
+
+    def _billing_service(self) -> Any:
+        return self._service("billing_service")
+
+    @staticmethod
+    def _billing_model_targets() -> list[tuple[str, str, dict[str, Any]]]:
+        """模型库当前每个条目的 (key, billing_script, billing_config)。"""
+        try:
+            from neobot_chat.models import model_registry
+        except Exception:  # pragma: no cover - 聊天包不可用时面板其余功能仍可用
+            return []
+        targets: list[tuple[str, str, dict[str, Any]]] = []
+        try:
+            items = model_registry.items()
+        except Exception:  # pragma: no cover
+            return []
+        for key, model in items:
+            config = getattr(model, "billing_config", None)
+            targets.append(
+                (
+                    str(key),
+                    str(getattr(model, "billing_script", "") or ""),
+                    dict(config) if isinstance(config, dict) else {},
+                )
+            )
+        return targets
+
+    async def config_billing(self, request: web.Request) -> web.Response:
+        """GET /api/config/billing：全局策略 + 可用脚本 + 每个模型条目的绑定情况。"""
+        service = self._billing_service()
+        if service is None:
+            return _json_ok(
+                {
+                    "available": False,
+                    "enabled": False,
+                    "scripts": [],
+                    "templates": [],
+                    "policies": {},
+                    "bindings": [],
+                    "errors": {},
+                }
+            )
+        data = service.describe()
+        data["bindings"] = service.bindings(self._billing_model_targets())
+        data["available"] = True
+        return _json_ok(data)
+
+    async def config_billing_reload(self, request: web.Request) -> web.Response:
+        """POST /api/config/billing/reload：显式重载计价脚本（需管理权限）。"""
+        denied = self._require_manage(request, action="重载计费脚本")
+        if denied is not None:
+            return denied
+        service = self._billing_service()
+        if service is None:
+            return _json_error("计费服务不可用（用量组件未装配）", status=503)
+        try:
+            payload = await self._read_json(request)
+        except ValueError as exc:
+            return _json_error(str(exc))
+        raw_names = payload.get("scripts")
+        names: list[str] | None = None
+        if isinstance(raw_names, list):
+            names = [str(item) for item in raw_names if str(item).strip()]
+        elif isinstance(raw_names, str) and raw_names.strip():
+            names = [raw_names]
+        try:
+            result = service.reload_scripts(names)
+        except Exception as exc:  # pragma: no cover - 重载本身不应抛错
+            return _json_error(f"重载计费脚本失败: {exc}", status=500)
+        result["bindings"] = service.bindings(self._billing_model_targets())
+        result["settings"] = service.settings.to_dict()
+        return _json_ok(result)
+
+    async def config_billing_preview(self, request: web.Request) -> web.Response:
+        """POST /api/config/billing/preview：只读试算，不写库（A1）。"""
+        service = self._billing_service()
+        if service is None:
+            return _json_error("计费服务不可用（用量组件未装配）", status=503)
+        try:
+            payload = await self._read_json(request)
+        except ValueError as exc:
+            return _json_error(str(exc))
+
+        import datetime as _dt
+
+        from neobot_app.statistics.billing import (
+            build_billing_context,
+            builtin_cost,
+        )
+
+        model_key = str(payload.get("model_key") or "").strip()
+        model = None
+        if model_key:
+            try:
+                from neobot_chat.models import model_registry
+
+                model = model_registry.get(model_key)
+            except Exception:
+                model = None
+            if model is None:
+                return _json_error(f"模型库中不存在模型条目: {model_key}")
+
+        script = payload.get("billing_script")
+        script_name = (
+            str(script).strip()
+            if script is not None
+            else str(getattr(model, "billing_script", "") or "").strip()
+        )
+        raw_config = payload.get("billing_config")
+        if isinstance(raw_config, dict):
+            billing_config = {str(k): v for k, v in raw_config.items()}
+        else:
+            model_config = getattr(model, "billing_config", None)
+            billing_config = dict(model_config) if isinstance(model_config, dict) else {}
+
+        raw_usage = payload.get("usage")
+        usage: dict[str, Any] = {}
+        if isinstance(raw_usage, dict):
+            for name in (
+                "input_tokens",
+                "output_tokens",
+                "cache_hit_tokens",
+                "cache_miss_tokens",
+                "completion_tokens_details",
+            ):
+                if name in raw_usage:
+                    usage[name] = raw_usage[name]
+        for name in ("input_tokens", "output_tokens", "cache_hit_tokens", "cache_miss_tokens"):
+            if name not in usage:
+                try:
+                    usage[name] = int(payload.get(name) or 0)
+                except (TypeError, ValueError):
+                    usage[name] = 0
+
+        occurred_at = None
+        raw_time = payload.get("occurred_at")
+        if isinstance(raw_time, str) and raw_time.strip():
+            try:
+                occurred_at = _dt.datetime.fromisoformat(raw_time.strip())
+            except ValueError:
+                return _json_error("occurred_at 不是合法的 ISO8601 时间")
+
+        pricing = getattr(model, "pricing", None)
+        settings = getattr(model, "settings", None)
+        context = build_billing_context(
+            model_key=model_key,
+            model_name=str(getattr(model, "model_name", "") or ""),
+            provider=str(getattr(model, "provider_name", "") or ""),
+            model_type=str(getattr(model, "model_type", "chat") or "chat"),
+            module=str(payload.get("module") or "preview"),
+            usage=usage,
+            pricing=pricing,
+            settings=settings,
+            billing_config=billing_config,
+            conversation_kind=str(payload.get("conversation_kind") or ""),
+            conversation_id=str(payload.get("conversation_id") or ""),
+            occurred_at=occurred_at,
+        )
+        builtin = builtin_cost(
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            cache_hit_tokens=int(usage.get("cache_hit_tokens") or 0),
+            cache_miss_tokens=int(usage.get("cache_miss_tokens") or 0),
+            pricing=pricing,
+        )
+        timeout_ms = payload.get("timeout_ms")
+        try:
+            outcome = service.preview(
+                script_name=script_name,
+                ctx=context,
+                fallback_cost=builtin,
+                timeout_ms=int(timeout_ms) if timeout_ms is not None else None,
+            )
+        except Exception as exc:  # pragma: no cover - preview 自身不应抛错
+            return _json_error(f"试算失败: {exc}", status=500)
+        payload_out = outcome.to_payload()
+        payload_out.update(
+            {
+                "model_key": model_key,
+                "billing_script": script_name,
+                "billing_config": billing_config,
+                "builtin_cost_cny": builtin,
+                "enabled": service.settings.enabled,
+                "occurred_at": context["occurred_at"],
+                "local_time": context["local_time"],
+                "tzname": context["tzname"],
+            }
+        )
+        return _json_ok(payload_out)
+
+    async def stats_usage_records(self, request: web.Request) -> web.Response:
+        """GET /api/stats/usage/records：最近若干条原始记录（来源 / 可选分项）。"""
+        hours = self._int_arg(request, "hours", 24, minimum=1, maximum=24 * 365)
+        limit = self._int_arg(request, "limit", 20, minimum=1, maximum=200)
+        with_detail = str(request.query.get("detail") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        session_factory = self._service("usage_session_factory")
+        if session_factory is None:
+            return _json_ok({"available": False, "items": []})
+        try:
+            import datetime as _dt
+
+            from neobot_storage.repositories.usage import SqlAlchemyUsageRepository
+
+            cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
+            async with session_factory() as session:
+                repo = SqlAlchemyUsageRepository(session)
+                records = await repo.stats_since(cutoff)
+        except Exception as exc:
+            self.logger.warning(f"读取用量明细失败: {exc}")
+            return _json_ok({"available": False, "items": [], "error": str(exc)})
+
+        items: list[dict[str, Any]] = []
+        for record in records[:limit]:
+            source = str(getattr(record, "cost_source", "") or "builtin")
+            item: dict[str, Any] = {
+                "at": record.created_at.isoformat() if record.created_at else "",
+                "module": str(record.module_name or ""),
+                "model_name": str(record.model_name or ""),
+                "provider_name": str(record.provider_name or ""),
+                "input_tokens": int(record.input_tokens or 0),
+                "output_tokens": int(record.output_tokens or 0),
+                "cache_hit_tokens": int(record.cache_hit_tokens or 0),
+                "cache_miss_tokens": int(record.cache_miss_tokens or 0),
+                "cost_cny": float(record.cost_cny or 0.0),
+                "cost_source": source,
+                "cost_source_kind": (
+                    "script"
+                    if source.startswith("script:")
+                    else ("fallback" if source.startswith("fallback:") else "builtin")
+                ),
+                "negative": float(record.cost_cny or 0.0) < 0,
+            }
+            if with_detail:
+                item["cost_detail"] = _parse_cost_detail(getattr(record, "cost_detail", None))
+            items.append(item)
+        return _json_ok({"available": True, "hours": hours, "items": items})
+
+    # ------------------------------------------------------------------
     # 日志 / 任务 / 服务
     # ------------------------------------------------------------------
 
@@ -599,6 +857,17 @@ class DashboardApi:
             "auto_disabled": bool(getattr(snapshot, "auto_disabled", False)),
             # 配置校验告警：非空表示已存值非法、运行时已回落默认值
             "config_error": getattr(snapshot, "config_error", None),
+            # 命令重名导致的自动改名：原 /x -> 实际 /plugin__x（spec(4) R26）
+            "command_renames": [
+                {
+                    "requested": f"/{requested}",
+                    "actual": f"/{actual}",
+                    "message": f"原 /{requested} → 实际 /{actual}（重名）",
+                }
+                for requested, actual in (
+                    getattr(snapshot, "command_renames", ()) or ()
+                )
+            ],
         }
 
     async def extensions(self, request: web.Request) -> web.Response:
@@ -848,6 +1117,13 @@ class DashboardApi:
         return _operation_response(result, f"{name} 已卸载")
 
     async def plugins_install(self, request: web.Request) -> web.Response:
+        """安装第三方插件；dry_run=true 只探测不写盘（spec(4) R27/D24）。
+
+        * 目标 ID 已存在且未显式 replace -> **拒绝**并回结构化冲突（409，磁盘零变化）；
+        * 目标 ID 命中官方插件目录 -> 直接拒绝（保留字，400）；
+        * replace=true -> 走既有备份路径，响应回显 backup_path；
+        * dry_run=true -> 只探测：不删、不覆盖、不产生备份。
+        """
         denied = self._require_manage(request)
         if denied is not None:
             return denied
@@ -860,10 +1136,52 @@ class DashboardApi:
             return _json_error(str(exc))
         repo = str(payload.get("repo") or "").strip()
         branch = str(payload.get("branch") or "").strip() or None
+        dry_run = bool(payload.get("dry_run"))
+        replace = bool(payload.get("replace"))
         if not repo:
             return _json_error("请填写 GitHub 仓库地址")
-        result = await control.install(repo, branch=branch, replace=bool(payload.get("replace")))
-        return _operation_response(result, f"已安装 {result.name}")
+        result = await control.install(
+            repo, branch=branch, replace=replace, dry_run=dry_run
+        )
+        conflict = getattr(result, "conflict", None)
+        if dry_run:
+            if not getattr(result, "ok", False):
+                return _json_error(
+                    str(getattr(result, "error", "") or "探测失败"),
+                    status=400,
+                    conflict=conflict,
+                )
+            name = str(getattr(result, "name", "") or "")
+            return _json_ok(
+                {
+                    "dry_run": True,
+                    "name": name,
+                    "version": getattr(result, "version", ""),
+                    "conflict": conflict,
+                    "message": (
+                        str(conflict.get("message"))
+                        if isinstance(conflict, dict) and conflict.get("message")
+                        else f"探测完成：{name} 可安装"
+                    ),
+                }
+            )
+        return _operation_response(result, f"已安装 {installed_name(result)}")
+
+    async def plugins_probe(self, request: web.Request) -> web.Response:
+        """按插件 ID 探测冲突（只读）：面板安装前的冲突态查询。"""
+        control = self._plugin_control()
+        if control is None:
+            return _json_error("插件运行时不可用", status=503)
+        name = str(request.query.get("name") or "").strip()
+        if not name:
+            return _json_error("缺少 name 参数")
+        prober = getattr(control, "probe", None)
+        if not callable(prober):
+            return _json_ok({"conflict": False, "existing": None, "official": False})
+        try:
+            return _json_ok(dict(prober(name)))
+        except Exception as exc:
+            return _json_error(f"冲突探测失败: {exc}", status=500)
 
     async def plugins_check_updates(self, request: web.Request) -> web.Response:
         control = self._plugin_control()
@@ -1837,6 +2155,12 @@ class DashboardApi:
             return _json_error(f"档案表清单读取失败: {exc}", status=500)
         payload["delete_enabled"] = self._archive_delete_enabled()
         payload["can_manage"] = self._can_manage(request)
+        # AI 压缩入口可用性 + 目标字符数区间（spec(4) Part C / §4.10.2）。
+        summary = self._archive_summary_service()
+        payload["summarize_available"] = summary is not None
+        bounds = self._summarize_target_bounds(summary)
+        if bounds is not None:
+            payload["min_target_chars"], payload["max_target_chars"] = bounds
         return _json_ok(payload)
 
     async def archives_over_limit(self, request: web.Request) -> web.Response:
@@ -2014,6 +2338,174 @@ class DashboardApi:
                 "message": "档案已删除（可在 neobot.log 中追溯被删内容）",
             }
         )
+
+    # ------------------------------------------------------------------
+    # AI 压缩（spec(4) Part C：面板手动 / 批量触发 + 压缩历史只读）
+    # ------------------------------------------------------------------
+
+    def _archive_summary_service(self) -> Any:
+        """档案自动总结服务（宿主服务 archive_summary_service）。"""
+        return self._service("archive_summary_service")
+
+    def _archive_summary_missing(self) -> web.Response:
+        return _json_error(
+            "档案总结服务不可用（未注入 archive_summary_service）", status=503
+        )
+
+    @staticmethod
+    def _summarize_target_bounds(summary: Any) -> tuple[int, int] | None:
+        """面板显示用的目标区间（由服务层给出唯一真相，缺失时不显示）。"""
+        getter = getattr(summary, "manual_target_bounds", None)
+        if not callable(getter):
+            return None
+        try:
+            lower, upper = getter()
+        except Exception:
+            return None
+        return int(lower), int(upper)
+
+    @staticmethod
+    def _target_chars_arg(body: dict[str, Any]) -> Any:
+        """从请求体取 target_chars（缺失即报错，不在面板侧做隐式默认）。"""
+        return body.get("target_chars")
+
+    async def archives_summarize_start(self, request: web.Request) -> web.Response:
+        """对指定一条档案手动触发一轮 AI 压缩（R14 / R15；202 + task_id）。"""
+        denied = self._require_manage(request, action="触发档案压缩")
+        if denied is not None:
+            return denied
+        summary = self._archive_summary_service()
+        if summary is None:
+            return self._archive_summary_missing()
+        try:
+            body = await self._read_json(request)
+        except ValueError as exc:
+            return _json_error(str(exc))
+        table = str(body.get("table") or "").strip()
+        key = str(body.get("key") or "").strip()
+        if not table or not key:
+            return _json_error("缺少 table / key")
+        from . import archives as archive_admin
+
+        if archive_admin.is_internal_table(table):
+            return _json_error(
+                f"{table} 是程序维护的内部表，禁止触发 AI 压缩（与禁止编辑同口径）"
+            )
+        target = self._target_chars_arg(body)
+        if target is None:
+            return _json_error("缺少 target_chars（本次压缩的目标字符数）")
+        ip = self.console.request_ip(request)
+        try:
+            payload = await summary.start_manual_compression(
+                table, key, target_chars=target, operator_ip=ip
+            )
+        except ValueError as exc:
+            return _json_error(str(exc))
+        except RuntimeError as exc:
+            return _json_error(str(exc), status=503)
+        self.logger.info(
+            f"面板触发 AI 档案压缩 table={table} key={key} "
+            f"target_chars={payload.get('target_chars')} status={payload.get('status')} "
+            f"task_id={payload.get('task_id')} ip={ip}"
+        )
+        if payload.get("task_id") and payload.get("status") == "running":
+            return web.json_response(payload, status=202)
+        return _json_ok(payload)
+
+    async def archives_summarize_status(self, request: web.Request) -> web.Response:
+        """轮询一次压缩任务的状态（R18：running / done / failed + 前后字数）。"""
+        denied = self._require_manage(request, action="查看档案压缩状态")
+        if denied is not None:
+            return denied
+        summary = self._archive_summary_service()
+        if summary is None:
+            return self._archive_summary_missing()
+        task_id = str(request.query.get("task_id") or "").strip()
+        if not task_id:
+            return _json_error("缺少查询参数 task_id")
+        payload = summary.get_manual_task(task_id)
+        if payload is None:
+            return _json_error(
+                f"没有该压缩任务: {task_id}（进程重启后任务状态会清空）",
+                status=404,
+            )
+        return _json_ok(payload)
+
+    async def archives_summarize_over_limit(self, request: web.Request) -> web.Response:
+        """批量压缩当前超限档案（R20：逐条串行、统一目标、返回 truncated 与 skipped）。"""
+        denied = self._require_manage(request, action="批量压缩超限档案")
+        if denied is not None:
+            return denied
+        summary = self._archive_summary_service()
+        if summary is None:
+            return self._archive_summary_missing()
+        try:
+            body = await self._read_json(request)
+        except ValueError as exc:
+            return _json_error(str(exc))
+        target = self._target_chars_arg(body)
+        if target is None:
+            return _json_error("缺少 target_chars（本次压缩的目标字符数）")
+        table = str(body.get("table") or "").strip() or None
+        ip = self.console.request_ip(request)
+        try:
+            payload = await summary.start_batch_compression(
+                target_chars=target, operator_ip=ip, table_name=table
+            )
+        except ValueError as exc:
+            return _json_error(str(exc))
+        except RuntimeError as exc:
+            return _json_error(str(exc), status=503)
+        self.logger.info(
+            f"面板触发批量档案压缩 target_chars={payload.get('target_chars')} "
+            f"count={len(payload.get('items') or [])} truncated={payload.get('truncated')} "
+            f"task_id={payload.get('task_id')} ip={ip}"
+        )
+        if payload.get("task_id") and payload.get("status") == "running":
+            return web.json_response(payload, status=202)
+        return _json_ok(payload)
+
+    async def archives_snapshots(self, request: web.Request) -> web.Response:
+        """某条档案的压缩历史（只读快照列表；**不提供一键恢复**，A47）。"""
+        denied = self._require_manage(request, action="查看档案压缩历史")
+        if denied is not None:
+            return denied
+        service = self._archive_service()
+        if service is None:
+            return self._archive_missing()
+        table = str(request.query.get("table") or "").strip()
+        key = str(request.query.get("key") or "").strip()
+        if not table or not key:
+            return _json_error("缺少查询参数 table / key")
+        from . import archives as archive_admin
+
+        current = await service.get(table, key)
+        current_chars = (
+            len(str(getattr(current, "value", "") or "")) if current is not None else None
+        )
+        payload = await archive_admin.snapshot_history(
+            service, table=table, key=key, current_chars=current_chars
+        )
+        return _json_ok(payload)
+
+    async def archives_snapshot(self, request: web.Request) -> web.Response:
+        """读取某一份快照的全文（只读；恢复需人工走编辑接口）。"""
+        denied = self._require_manage(request, action="查看档案压缩快照")
+        if denied is not None:
+            return denied
+        service = self._archive_service()
+        if service is None:
+            return self._archive_missing()
+        raw = request.query.get("id")
+        try:
+            snapshot_id = int(str(raw))
+        except (TypeError, ValueError):
+            return _json_error("查询参数 id 必须是整数")
+        getter = getattr(service, "get_snapshot", None)
+        entry = await getter(snapshot_id) if callable(getter) else None
+        if entry is None:
+            return _json_error(f"没有该快照: {snapshot_id}", status=404)
+        return _json_ok({"snapshot": entry})
 
     # ------------------------------------------------------------------
     # 定时任务（读走管理器投影，写走 reminder skill）
@@ -2247,19 +2739,34 @@ def _status_text(snapshot: Any) -> str:
     return state or "unloaded"
 
 
+def installed_name(result: Any) -> str:
+    return str(getattr(result, "name", "") or "")
+
+
 def _operation_response(result: Any, success_message: str) -> web.Response:
+    conflict = getattr(result, "conflict", None)
     if getattr(result, "ok", False):
-        return _json_ok(
-            {
-                "message": success_message,
-                "name": getattr(result, "name", ""),
-                "state": getattr(result, "state", None),
-                "requires_restart": bool(getattr(result, "requires_restart", False)),
-            }
-        )
+        payload: dict[str, Any] = {
+            "message": success_message,
+            "name": getattr(result, "name", ""),
+            "state": getattr(result, "state", None),
+            "requires_restart": bool(getattr(result, "requires_restart", False)),
+        }
+        version = getattr(result, "version", "")
+        if version:
+            payload["version"] = version
+        backup_path = getattr(result, "backup_path", None)
+        if backup_path is not None:
+            payload["backup_path"] = str(backup_path)
+            payload["message"] = f"{success_message}（旧版本已备份到 {backup_path}）"
+        if conflict:
+            payload["conflict"] = conflict
+        return _json_ok(payload)
+    # 冲突是「可二选一」的显式状态，用 409 区分于普通参数错误
     return _json_error(
         str(getattr(result, "error", "") or "操作失败"),
-        status=400,
+        status=409 if conflict else 400,
         name=getattr(result, "name", ""),
         state=getattr(result, "state", None),
+        conflict=conflict,
     )

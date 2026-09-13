@@ -163,6 +163,40 @@ def plan_maintenance_run(
 _MAINTENANCE_RETRY_STATUSES = frozenset({"failed", "running"})
 
 
+def _register_billing_hot_reload_rule() -> None:
+    """登记 ``billing`` 段为「运行期生效」（spec(4) Q13 / R4）。
+
+    ``[billing]`` 段由 BillingService 每次现取，改 ``enabled`` / ``timeout_ms`` 等
+    立即生效；挂在 ``models`` 段下的 ``billing_script`` / ``billing_config`` 仍按
+    「面板保存并重载」路径生效。
+    """
+    from neobot_app.config.hot_reload import HotReloadRule, register_rule
+
+    register_rule(HotReloadRule("billing", True, "计费脚本按需加载，重载后立即生效"))
+
+
+def _warmup_billing_scripts(billing: Any) -> None:
+    """启动装配期预加载「注册表里出现过的 billing_script 名字集合」（§4.2）。"""
+    if billing is None:
+        return
+    try:
+        settings = billing.settings
+        if not settings.enabled:
+            # 关闭时不加载任何脚本、不建线程池（零额外开销）
+            return
+        from neobot_chat.models import model_registry
+
+        names = {
+            str(getattr(model, "billing_script", "") or "").strip()
+            for _key, model in model_registry.items()
+        }
+        billing.warmup(sorted(name for name in names if name))
+    except Exception as exc:  # pragma: no cover - 预加载失败不影响启动
+        import logging
+
+        logging.getLogger(__name__).warning(f"计费脚本预加载失败: {exc}")
+
+
 def _build_provider_reload_consumer(
     *,
     logger_factory: Any,
@@ -679,8 +713,32 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
 
     usage = _reuse_or(
         "usage",
-        lambda: build_usage_components(_engine=_engine, logger_factory=logger_factory),
+        lambda: build_usage_components(
+            _engine=_engine,
+            logger_factory=logger_factory,
+            config=config,
+        ),
     )
+
+    # ── 本体级头像存储（spec(5) §4.9 / R33–R37）──
+    # 复用同一份 storage 引擎：头像三列就在 user_data 上，所以「有 user_data 行
+    # = 认识该用户」自动覆盖「聊过天的人」。软重启时复用实例（内存缓存与在途
+    # 下载不重建），配置项在构造期读取。
+    from neobot_app.runtime.avatar_store import AvatarStore
+
+    avatar_store = _reuse_or(
+        "avatar_store",
+        lambda: AvatarStore(
+            uow_factory=uow_factory,
+            config=config,
+            logger=logger_factory.get_logger("app.avatar_store"),
+        ),
+    )
+
+    # 计费脚本按需加载：登记热重载规则，面板/文件变更后无需重启进程（spec(4) §4.4 / Q13）。
+    # 放在 _reuse_or 之外，保证软重启复用组件时规则依然登记在案。
+    _register_billing_hot_reload_rule()
+    _warmup_billing_scripts(usage.get("billing"))
 
     group_queue, friend_queue = build_message_queues(config=config)
 
@@ -883,8 +941,12 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
         sleep_service=sleep_service,
         standby_service=standby_service,
         config_reload_callback=_reload_config_from_command,
+        screenshots=browser["screenshots"],
     ),
     )
+    if command_service is not None:
+        # 软重启会重建浏览器实例：截图端口必须跟着换，否则 /help 会打到旧实例
+        command_service.set_screenshots(browser["screenshots"])
 
     # ── 凭据管理器(风险操作授权:踢人/退群需超级管理员凭据) ──
     credential_manager = build_credential_manager(
@@ -1092,6 +1154,19 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
     maintenance_coros = []
     # 睡眠剩余时间播报：睡眠期间每分钟打印剩余时间（仅日志，不回复）
     maintenance_coros.append(sleep_service.ticker())
+    # /help 预渲染缓存（spec(5) §4.2 / R9）：后台异步、不阻塞启动；
+    # 软重启时运行时工厂会重新执行本函数，因此同样会再跑一次。
+    # commands 传可调用对象：协程真正运行时才读命令表，插件命令此时已注册。
+    if command_service is not None:
+        from neobot_app.runtime import help_cache
+
+        maintenance_coros.append(
+            help_cache.make_prerender_coro(
+                commands=command_service.registry.commands,
+                screenshots=browser["screenshots"],
+                log=logger_factory.get_logger("app.commands"),
+            )
+        )
     if (
         sandbox["sandbox_service"] is not None
         and admin_accounts
@@ -1362,6 +1437,10 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
             "command_service": (command_service, "命令服务"),
             "credential_manager": (credential_manager, "凭据管理器"),
             "sleep_service": (sleep_service, "睡眠服务"),
+            "avatar_store": (
+                avatar_store,
+                "用户头像本地存储与惰性刷新（spec(5) §4.9）",
+            ),
             "standby_service": (standby_service, "待机服务（只保留核心服务 / 软重启运行）"),
             "prompt_analyzer": (prompt_analyzer, "提示词分析（面板分析页）"),
             "cache_calculator": (cache_calculator, "缓存命中计算器"),
@@ -1374,6 +1453,7 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
                 "用量数据库会话工厂",
             ),
             "report_service": (usage["report_service"], "用量报告服务"),
+            "billing_service": (usage.get("billing"), "消耗计费脚本服务（spec(4) Part A）"),
             "archive_memory_service": (memory_svcs["archive_memory_service"], "档案记忆服务"),
             "archive_summary_service": (
                 archive_summary_service,
@@ -1439,6 +1519,7 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
         credential_manager=credential_manager,
         sleep_service=sleep_service,
         standby_service=standby_service,
+        avatar_store=avatar_store,
         owns_plugins=owns_plugins,
     )
 

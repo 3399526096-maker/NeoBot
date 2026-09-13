@@ -165,13 +165,16 @@ class ModelSettings:
         default=1.0,
         metadata={"description": "Top P 采样参数"},
     )
+    # ── 可选参数（spec(4) Part B）：只有列入 enabled_params 才会下发到请求体 ──
+    # 值一律原地保留：未列入 enabled_params 只是不下发，重新加入即恢复。
+    # hidden=True：不出现在通用表单里，改由模型参数区（kind=model_params）按需增删。
     frequency_penalty: float = field(
         default=0.0,
-        metadata={"description": "频率惩罚"},
+        metadata={"description": "频率惩罚", "hidden": True},
     )
     presence_penalty: float = field(
         default=0.0,
-        metadata={"description": "存在惩罚"},
+        metadata={"description": "存在惩罚", "hidden": True},
     )
     image_api: str = field(
         default="auto",
@@ -181,13 +184,32 @@ class ModelSettings:
             "/images/generations（参考图作为 JSON 字段传递）",
             "options": ["auto", "edits", "generations"],
             "options_strict": True,
+            "hidden": True,
         },
     )
     image_reference_param: str = field(
         default="image",
         metadata={
             "description": "generations 模式下参考图的 JSON 字段名（不同中转站可能是 image / images / "
-            "image_url / image_urls / input_image）"
+            "image_url / image_urls / input_image）",
+            "hidden": True,
+        },
+    )
+    enabled_params: List[str] = field(
+        default_factory=list,
+        metadata={
+            "description": "本模型启用的可选参数名清单（spec(4) Part B）：只有列在这里的可选参数才会"
+            "进入请求体；未列入的参数值原样保留在配置里，重新加入即恢复。可用名字见参数目录"
+            "（频率惩罚 / 存在惩罚 / 生图接口形态 / 参考图字段名 / DeepSeek 思考参数）",
+            "hidden": True,
+        },
+    )
+    extra_body: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "description": "自定义请求体参数（key = 参数名，value 原样并入请求体）：聊天模型并入聊天"
+            "请求体，生图模型并入生图 payload。键名不得以双下划线（__）开头（内部命名空间）",
+            "hidden": True,
         },
     )
 
@@ -204,6 +226,7 @@ class DeepSeekModelSettings(ModelSettings):
             "description": "思考模式开关（OpenAI 样式）：enabled 开启（默认），disabled 关闭，random 按概率随机开启",
             "options": ["enabled", "disabled", "random"],
             "options_strict": True,
+            "hidden": True,
         },
     )
     deepseek_reasoning_effort: str = field(
@@ -212,12 +235,14 @@ class DeepSeekModelSettings(ModelSettings):
             "description": "思考强度控制（OpenAI 样式）：low/medium 映射为 high，xhigh 映射为 max，可选 high（默认）或 max",
             "options": ["high", "max"],
             "options_strict": True,
+            "hidden": True,
         },
     )
     deepseek_random_thinking_probability: float = field(
         default=0.6,
         metadata={
-            "description": "随机思考开启概率，范围 0.0 到 1.0，仅在思考模式为 random 时生效"
+            "description": "随机思考开启概率，范围 0.0 到 1.0，仅在思考模式为 random 时生效",
+            "hidden": True,
         },
     )
 
@@ -294,6 +319,21 @@ class ModelDefinition:
         metadata={
             "description": "该模型/供应商的余额查询方式（文本描述，可写请求地址、方法、鉴权与返回字段）。"
             "留空表示没有查询提示，余额查询 skill 不会列出该模型"
+        },
+    )
+    billing_script: str = field(
+        default="",
+        metadata={
+            "description": "该模型使用的计价脚本名（对应 <数据目录>/Billing/<名字>.py）。"
+            "留空 = 该模型走固定计费；多个模型可引用同一名字（脚本只加载一份）。"
+            "需配合 [billing].enabled=true 生效"
+        },
+    )
+    billing_config: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "description": "传给计价脚本的参数表（脚本内通过 ctx[\"billing_config\"] 读取），"
+            "例如按次计费脚本的 price_per_call = 0.01；同一脚本可被多个模型复用、各自定价"
         },
     )
 
@@ -752,6 +792,43 @@ class Willing:
     observe_window: Optional[int] = field(
         default=5,
         metadata={"description": "意愿计算观察窗口"},
+    )
+
+
+@dataclass
+class Billing:
+    """消耗计费配置（spec(4) Part A）。
+
+    计价脚本**按模型条目绑定**（models.registry[].billing_script）；本段只放全局执行
+    策略，默认关闭 = 全部模型走既有固定计费公式。
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "description": "是否启用按模型绑定的计价脚本。关闭时全部模型走既有固定计费公式"
+            "（零额外开销、零风险）；开启后仅对填写了 billing_script 的模型生效"
+        },
+    )
+    timeout_ms: int = field(
+        default=200,
+        metadata={
+            "description": "单次脚本求值超时（毫秒）。超时即放弃脚本结果、改用固定计费并告警；"
+            "过大会直接阻塞回复管线"
+        },
+    )
+    reload_on_change: bool = field(
+        default=True,
+        metadata={
+            "description": "计费脚本文件的修改时间（纳秒）或大小变化时自动重载，无需重启进程"
+        },
+    )
+    record_detail: bool = field(
+        default=True,
+        metadata={
+            "description": "是否把脚本返回的分项（components / note）写入 cost_detail 列；"
+            "关闭只存金额，节省空间"
+        },
     )
 
 
@@ -1454,6 +1531,51 @@ class Agent:
 
 
 @dataclass
+class AvatarsConfig:
+    """本体级用户头像存储（spec(5) §4.9 / R33–R37）。"""
+
+    enabled: bool = field(
+        default=True,
+        metadata={
+            "description": "是否启用用户头像的本地存储与惰性刷新；关闭后不做过期判定、"
+            "不发起下载，已有头像仍可被卡片读取",
+        },
+    )
+    refresh_days: int = field(
+        default=7,
+        metadata={
+            "description": "头像过期天数：用户再次出现在聊天流且距上次获取超过该天数"
+            "才重新获取；未过期零网络开销",
+        },
+    )
+    fail_cooldown_seconds: int = field(
+        default=600,
+        metadata={
+            "description": "下载失败后的冷却秒数：冷却期内该用户再次发言不重试，"
+            "避免把一次失败放大成网络风暴",
+        },
+    )
+    max_concurrent: int = field(
+        default=2,
+        metadata={
+            "description": "头像下载的全局并发上限；超限的触发直接丢弃，该用户下次出现时自然重试",
+        },
+    )
+    max_bytes: int = field(
+        default=524288,
+        metadata={
+            "description": "单张头像的字节上限（默认 512 KiB）；超出不落盘并按获取失败处理",
+        },
+    )
+    keep_days: int = field(
+        default=90,
+        metadata={
+            "description": "长期未活跃用户的头像保留天数；超期清理文件并清空对应表字段",
+        },
+    )
+
+
+@dataclass
 class WebSearchConfig:
     """联网搜索工具包配置。"""
 
@@ -1498,6 +1620,8 @@ class BotConfig:
     scheduled_task: ScheduledTask = field(default_factory=ScheduledTask)
     agent: Agent = field(default_factory=Agent)
     web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
+    billing: Billing = field(default_factory=Billing)
+    avatars: AvatarsConfig = field(default_factory=AvatarsConfig)
 
 
 @dataclass
@@ -1526,7 +1650,13 @@ class EnhancedChat(Chat):
     )
     at_mention_reply_delay_seconds: Optional[float] = field(
         default=5.0,
-        metadata={"description": "@ 提及时的回复延迟秒数；在此期间收集后续群消息后再生成回复"},
+        metadata={
+            "description": (
+                "@ 提及时的回复延迟秒数；在此期间收集后续群消息后再生成回复。"
+                "正文命中插件登记的玩法关键词（漂流瓶 / 签到 / 抽签 等）时跳过该等待，"
+                "直接触发回复事件"
+            )
+        },
     )
     willing_global_coefficient: Optional[float] = field(
         default=1.0,
@@ -1683,6 +1813,13 @@ class EnhancedChat(Chat):
     reaction_weight: Optional[float] = field(
         default=0.2,
         metadata={"description": "表情回应事件在消息队列中的权重，结算队列长度时按此权重计算（0.2表示5个表情回应等同1条消息）"},
+    )
+    self_sent_message_weight: Optional[float] = field(
+        default=0.1,
+        metadata={
+            "description": "Bot 自身发言（含实时入队与历史灌入两个来源）与后台通知在消息队列中的权重；"
+            "0.1 表示 10 条自身发言才等同 1 条用户消息，基本不挤占观测窗口与上下文窗口"
+        },
     )
     official_bot_reply_coefficient: Optional[float] = field(
         default=0.05,

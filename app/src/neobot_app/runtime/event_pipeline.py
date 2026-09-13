@@ -24,6 +24,7 @@ from neobot_contracts.ports.logging import Logger, NullLogger
 
 from neobot_app.config.schemas.bot import BotConfig
 from neobot_app.image import ImageParseService
+from neobot_app.message.fast_reply_keywords import matches_reply_trigger
 from neobot_app.message.process import event_message__to_text
 from neobot_app.message.queue import MessageQueue
 from neobot_app.reply import ReplyOrchestrator
@@ -93,6 +94,7 @@ class EventPipeline:
         credential_manager: Any | None = None,
         sleep_service: Any | None = None,
         standby_service: Any | None = None,
+        avatar_store: Any | None = None,
     ) -> None:
         self.adapter = adapter
         self._group_queue = group_message_queue
@@ -112,6 +114,8 @@ class EventPipeline:
         self._standby_service = standby_service
         self._credential_manager = credential_manager
         self._sleep_service = sleep_service
+        # 本体级头像存储（spec(5) §4.9 / R34）：消息路径只做过期判定并触发后台下载。
+        self._avatar_store = avatar_store
         self._warmed_up_friends: set[str] = set()
         self._warmup_lock = asyncio.Lock()
         self._replying_queues: set[str] = set()
@@ -305,6 +309,7 @@ class EventPipeline:
         event: Dict[str, Any],
         *,
         skip_ai_reply: bool = False,
+        agent_intent: Dict[str, Any] | None = None,
     ) -> None:
         message = safe_parse_model(event, PrivateMessage)
         if await self._is_duplicate_message(message):
@@ -334,6 +339,14 @@ class EventPipeline:
                 command_consumed = True
                 command_background = result.background
 
+        # 插件消息处理器请求的「交主管线」意图（spec(5) R13/R14）：与命令
+        # sync_reply 共用同一条通路 —— 消息照常入队（作为上下文保留），但由
+        # 背景内容触发一次回复；preactivate 让指定技能包在**本轮**工具表生效。
+        agent_preactivate: tuple[str, ...] = ()
+        if not command_consumed and agent_intent:
+            command_consumed = True
+            command_background = str(agent_intent.get("background") or "") or None
+            agent_preactivate = tuple(agent_intent.get("preactivate") or ())
         if self._skip_while_standby(
             kind="private", queue_key=queue_key, message=message
         ):
@@ -348,6 +361,7 @@ class EventPipeline:
             )
 
         await self._refresh_profile_for_message(message)
+        await self._maybe_refresh_avatar(message)
         if self._image_parse_service is not None:
             await self._image_parse_service.parse_message_images(message, queue_key)
         text = await event_message__to_text(message)
@@ -365,10 +379,11 @@ class EventPipeline:
         # 命令已消费:回复管线在此拦截(不再进入延迟回复/意愿判断);
         # sync_reply 命令额外以命令结果为背景触发回复管线
         if command_consumed:
-            if command_background:
+            if command_background or agent_preactivate:
                 self._start_command_sync_reply(
                     message=message, queue=self._friend_queue,
-                    queue_key=queue_key, background=command_background,
+                    queue_key=queue_key, background=command_background or "",
+                    preactivate=agent_preactivate,
                 )
             return
 
@@ -490,6 +505,7 @@ class EventPipeline:
         event: Dict[str, Any],
         *,
         skip_ai_reply: bool = False,
+        agent_intent: Dict[str, Any] | None = None,
     ) -> None:
         message = safe_parse_model(event, GroupMessage)
         if await self._is_duplicate_message(message):
@@ -519,6 +535,14 @@ class EventPipeline:
                 command_consumed = True
                 command_background = result.background
 
+        # 插件消息处理器请求的「交主管线」意图（spec(5) R13/R14）：与命令
+        # sync_reply 共用同一条通路 —— 消息照常入队（作为上下文保留），但由
+        # 背景内容触发一次回复；preactivate 让指定技能包在**本轮**工具表生效。
+        agent_preactivate: tuple[str, ...] = ()
+        if not command_consumed and agent_intent:
+            command_consumed = True
+            command_background = str(agent_intent.get("background") or "") or None
+            agent_preactivate = tuple(agent_intent.get("preactivate") or ())
         if self._skip_while_standby(
             kind="group", queue_key=queue_key, message=message
         ):
@@ -533,6 +557,7 @@ class EventPipeline:
             )
 
         await self._refresh_profile_for_message(message)
+        await self._maybe_refresh_avatar(message)
         if self._image_parse_service is not None:
             await self._image_parse_service.parse_message_images(message, queue_key)
         text = await event_message__to_text(message)
@@ -548,10 +573,11 @@ class EventPipeline:
         # 命令已消费:回复管线在此拦截(不再进入意愿判断/回复触发);
         # sync_reply 命令额外以命令结果为背景触发回复管线
         if command_consumed:
-            if command_background:
+            if command_background or agent_preactivate:
                 self._start_command_sync_reply(
                     message=message, queue=self._group_queue,
-                    queue_key=queue_key, background=command_background,
+                    queue_key=queue_key, background=command_background or "",
+                    preactivate=agent_preactivate,
                 )
             return
 
@@ -664,6 +690,18 @@ class EventPipeline:
                 replied_messages.append(data)
         return replied_messages
 
+    def _at_mention_instant_keyword(self, message: Any) -> str:
+        """被 @ 的正文是否命中「跳过收集等待」的插件关键词（命中返回关键词）。
+
+        关键词由插件登记（见 neobot_app.message.fast_reply_keywords）：玩法类
+        关键词（漂流瓶 / 签到 / 抽签 …）意图明确，不必再等收集窗口。
+        这里吞掉全部异常：关键词表坏掉不能影响消息管线。
+        """
+        try:
+            return matches_reply_trigger(message)
+        except Exception:  # pragma: no cover - 关键词表异常只降级
+            return ""
+
     async def _handle_willing_decision(
         self,
         *,
@@ -714,7 +752,17 @@ class EventPipeline:
                 if isinstance(val, (int, float)) and val >= 0:
                     delay = float(val)
 
-            if delay > 0:
+            # 正文命中插件登记的玩法关键词（漂流瓶 / 签到 / 抽签 …）时，
+            # 意图已经足够明确，不再等这几秒收集上下文，直接触发回复事件
+            instant_keyword = self._at_mention_instant_keyword(message)
+            if instant_keyword:
+                self._logger.info(
+                    "群聊@提及命中关键词，跳过收集等待",
+                    queue_key=queue_key,
+                    keyword=instant_keyword,
+                    delay_seconds=delay,
+                )
+            elif delay > 0:
                 self._logger.debug(
                     "群聊@提及延迟回复等待中",
                     queue_key=queue_key,
@@ -818,7 +866,16 @@ class EventPipeline:
             val = getattr(self._config.chat, "at_mention_reply_delay_seconds", None)
             if isinstance(val, (int, float)) and val >= 0:
                 delay = float(val)
-        if delay > 0:
+        # 玩法关键词同样跳过唤醒后的收集等待（意图明确，没必要再拖）
+        instant_keyword = self._at_mention_instant_keyword(message)
+        if instant_keyword:
+            self._logger.info(
+                "睡眠中被@命中关键词，跳过唤醒等待",
+                queue_key=queue_key,
+                keyword=instant_keyword,
+                delay_seconds=delay,
+            )
+        elif delay > 0:
             self._logger.debug(
                 "睡眠中被@唤醒,延迟回复等待中",
                 queue_key=queue_key,
@@ -1015,6 +1072,24 @@ class EventPipeline:
                 await self._handle_willing_decision(
                     message=msg, queue=self._group_queue, queue_key=queue_key
                 )
+
+    async def _maybe_refresh_avatar(self, message: PrivateMessage | GroupMessage) -> None:
+        """用户再次出现在聊天流 → 头像惰性刷新判定（spec(5) §4.9 / R34）。
+
+        本方法只做「一次 DB 读 + 一次时间比较」：下载由 AvatarStore 自己派生
+        后台任务，因此消息路径不会等网络。AvatarStore.maybe_refresh 内部已吞掉
+        全部异常，这里的 try 只是防御（宿主服务换成第三方实现时也不该影响收消息）。
+        """
+        store = getattr(self, "_avatar_store", None)
+        user_id = getattr(message, "user_id", None)
+        if store is None or user_id is None:
+            return
+        try:
+            await store.maybe_refresh(str(user_id))
+        except Exception as exc:
+            self._logger.debug(
+                "头像刷新判定失败", user_id=str(user_id), error=str(exc)
+            )
 
     async def _refresh_profile_for_message(
         self,
@@ -1295,9 +1370,13 @@ class EventPipeline:
         message: PrivateMessage | GroupMessage,
         queue: MessageQueue,
         queue_key: str,
-        background: str,
+        background: str = "",
+        preactivate: tuple[str, ...] = (),
     ) -> None:
-        """sync_reply 命令:命令结果作为背景内容触发回复管线。"""
+        """sync_reply 命令 / 插件消息意图:把背景内容交给回复管线触发一次回复。
+
+        preactivate 是本轮要在模型工具表里预先激活的技能包（插件意图入口用）。
+        """
         if self._reply_orchestrator is None:
             return
         from neobot_app.willing.models import WillingDecision
@@ -1322,6 +1401,7 @@ class EventPipeline:
             pre_reply_message_id=pre_reply_msg_id,
             on_reply_done=on_reply_done,
             background_content=background,
+            preactivate=tuple(preactivate or ()),
         )
         if started is None:
             # 管线被拒（编排器已关闭／同会话管线在跑／冷却中）：此时不能 discard ——

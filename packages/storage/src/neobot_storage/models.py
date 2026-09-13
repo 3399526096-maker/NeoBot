@@ -31,6 +31,18 @@ class UserData(Base):
     long_nick: Mapped[str | None] = mapped_column(Text)
     favorability: Mapped[int] = mapped_column(Integer, default=0)
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # ── 本体级头像存储（spec(5) §4.9 / R33–R37）──
+    # 头像与用户资料同表：**有 user_data 行 = 认识该用户**，天然覆盖「聊过天的人」，
+    # 不必再建一张用户表，也就不存在两处数据（资料有行、头像没行）不一致的问题。
+    #: 头像文件路径（<DATA_DIR>/avatars/<user_id>.png）；NULL = 尚无本地头像。
+    avatar_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: 上次成功获取头像的 UTC 时间；获取失败时**原样保留**（宁可旧头像，不要空头像）。
+    avatar_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 连续获取失败次数；成功一次即清零。失败冷却与诊断用。
+    #: server_default 与迁移 0027 保持一致：既有行 / 不显式赋值的新行都拿到 0。
+    avatar_fail_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
 
 
 class GroupData(Base):
@@ -90,6 +102,45 @@ class ArchiveMemoryData(Base):
     __table_args__ = (
         UniqueConstraint("table_name", "key", name="uq_archive_memories_table_key"),
         Index("ix_archive_memories_table_name_updated_at", "table_name", "updated_at"),
+    )
+
+
+class ArchiveSnapshotData(Base):
+    """压缩前档案快照（spec(4) Part C / D15）。
+
+    每次 AI 压缩在**改写之前**把原文原样存一份，用于「不可逆覆盖留痕」：
+    面板只提供只读列表与查看全文，**不提供一键恢复**（恢复属独立工作项）。
+
+    保留策略由 `ArchiveMemoryService.save_snapshot` 执行：同一
+    `(table_name, key)` 只保留最近 `MAX_ARCHIVE_SNAPSHOTS_PER_KEY` 份，
+    另有全局兜底上限 `MAX_ARCHIVE_SNAPSHOTS`。
+    """
+
+    __tablename__ = "archive_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    table_name: Mapped[str] = mapped_column(String, nullable=False)
+    key: Mapped[str] = mapped_column(String, nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    #: 压缩前该条档案的字符数（len(value)，与面板 total_chars 同口径）。
+    total_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: 压缩前的乐观锁版本号（人工恢复时用于 set_if_version）。
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: 压缩来源：manual（面板手动 / 批量）| auto（写超限自动压缩）。
+    reason: Mapped[str] = mapped_column(String, nullable=False, default="manual")
+    #: 触发者请求 IP（自动压缩为 NULL）。
+    operator_ip: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # 面板「压缩历史」按 (table, key) 倒序取最近 N 份；全局清理走 created_at。
+        Index(
+            "ix_archive_snapshots_table_name_key_created_at",
+            "table_name",
+            "key",
+            "created_at",
+        ),
+        Index("ix_archive_snapshots_created_at", "created_at"),
     )
 
 
@@ -239,6 +290,12 @@ class ModelUsageRecord(Base):
     cache_hit_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cache_miss_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cost_cny: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    #: 费用来源（闭集）：builtin / script:<name> / fallback:missing|error|timeout
+    cost_source: Mapped[str] = mapped_column(
+        String, nullable=False, default="builtin", server_default="builtin"
+    )
+    #: 脚本返回的分项 / 说明（JSON 单行；内建与无分项时为 NULL）
+    cost_detail: Mapped[str | None] = mapped_column(String, nullable=True)
     conversation_kind: Mapped[str | None] = mapped_column(String, nullable=True)
     conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

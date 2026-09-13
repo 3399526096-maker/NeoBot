@@ -2,12 +2,18 @@
 import { deleteJSON, getJSON, getResult, postJSON, putJSON } from './client';
 import type {
   ActiveUser,
+  PluginConflict,
   ArchiveDeleteBody,
   ArchiveItemDetail,
   ArchiveItemQuery,
   ArchiveItemsPayload,
+  ArchiveSnapshotDetail,
+  ArchiveSnapshotsPayload,
+  ArchiveSummarizeTask,
   ArchiveUpdateBody,
   ArchivesPayload,
+  BillingPayload,
+  BillingPreviewResult,
   BotSummary,
   ChatFlowDetailPayload,
   ChatFlowLatestPrompt,
@@ -23,6 +29,7 @@ import type {
   LogPayload,
   ModelsPayload,
   Overview,
+  PluginConflictSide,
   PluginListPayload,
   PromptAnalysisPayload,
   PromptPreviewPayload,
@@ -38,6 +45,7 @@ import type {
   SystemInfo,
   TasksPayload,
   UsagePayload,
+  UsageRecordsPayload,
 } from './types';
 
 export interface SimpleMessage {
@@ -58,6 +66,14 @@ export interface SimpleMessage {
   status?: number;
   detail?: string;
   models?: string[];
+  /** 显式替换时的备份路径（spec(4) R27） */
+  backup_path?: string;
+  /** 安装/更新解析出的版本 */
+  version?: string;
+  /** 安装冲突（HTTP 409）：两侧来源与版本 + 只能二选一 */
+  conflict?: PluginConflict | null;
+  /** 仅探测未写盘 */
+  dry_run?: boolean;
   [key: string]: unknown;
 }
 
@@ -132,6 +148,23 @@ export const api = {
   statsUsage: (hours = 24) => getJSON<UsagePayload>('/api/stats/usage?hours=' + hours),
   seriesUsage: (hours = 24, bucket = 'hour') =>
     getResult<UsagePayload>('/api/series/usage?hours=' + hours + '&bucket=' + bucket),
+  /** 最近调用明细：来源列（内建 / 脚本 / 兜底）+ 按需分项（spec(4) Part A） */
+  usageRecords: (hours = 24, limit = 20, detail = false) =>
+    getResult<UsageRecordsPayload>(
+      '/api/stats/usage/records?hours=' + hours + '&limit=' + limit + '&detail=' + (detail ? '1' : '0'),
+    ),
+
+  // 计费脚本（spec(4) Part A）
+  configBilling: () => getResult<BillingPayload>('/api/config/billing'),
+  configBillingReload: (scripts?: string[]) =>
+    postJSON<BillingPayload>('/api/config/billing/reload', scripts ? { scripts } : {}),
+  configBillingPreview: (body: {
+    model_key?: string;
+    billing_script?: string;
+    billing_config?: Record<string, unknown>;
+    usage?: Record<string, unknown>;
+    occurred_at?: string;
+  }) => postJSON<BillingPreviewResult>('/api/config/billing/preview', body),
 
   // 提示词分析
   analysisPrompts: () => getJSON<PromptAnalysisPayload>('/api/analysis/prompts'),
@@ -192,6 +225,21 @@ export const api = {
   /** 删除档案（硬删除；需要 X-CSRF-Token 与面板开关 allow_archive_delete） */
   archiveDelete: (body: ArchiveDeleteBody) => deleteJSON<SimpleMessage>('/api/archives/item', body),
 
+  // AI 压缩（spec(4) Part C）：手动触发一条 / 轮询状态 / 批量超限 / 压缩历史
+  archiveSummarize: (body: { table: string; key: string; target_chars: number }) =>
+    postJSON<ArchiveSummarizeTask>('/api/archives/summarize', body),
+  archiveSummarizeStatus: (taskId: string) =>
+    getJSON<ArchiveSummarizeTask>('/api/archives/summarize?task_id=' + encodeURIComponent(taskId)),
+  archiveSummarizeOverLimit: (body: { target_chars: number; table?: string }) =>
+    postJSON<ArchiveSummarizeTask>('/api/archives/summarize/over-limit', body),
+  /** 压缩历史（只读快照列表，不含全文；不提供一键恢复） */
+  archiveSnapshots: (table: string, key: string) =>
+    getJSON<ArchiveSnapshotsPayload>(
+      '/api/archives/snapshots?table=' + encodeURIComponent(table) + '&key=' + encodeURIComponent(key),
+    ),
+  archiveSnapshot: (id: number) =>
+    getJSON<ArchiveSnapshotDetail>('/api/archives/snapshot?id=' + encodeURIComponent(String(id))),
+
   // 定时任务管理
   scheduledTasks: (includeDisabled = true, limit = 200) =>
     getJSON<ScheduledTasksPayload>(
@@ -210,8 +258,15 @@ export const api = {
   pluginUpdate: (name: string) => postJSON<SimpleMessage>('/api/plugins/' + encodeURIComponent(name) + '/update'),
   pluginUninstall: (name: string) =>
     postJSON<SimpleMessage>('/api/plugins/' + encodeURIComponent(name) + '/uninstall'),
-  pluginInstall: (repo: string, branch = 'main', replace = false) =>
-    postJSON<SimpleMessage>('/api/plugins/install', { repo, branch, replace }),
+  /**
+   * 安装第三方插件。dryRun=true 只探测不写盘：返回体带 conflict（若有）。
+   * 冲突确认替换时必须显式传 replace=true（spec(4) R27/D24）。
+   */
+  pluginInstall: (repo: string, branch = 'main', replace = false, dryRun = false) =>
+    postJSON<SimpleMessage>('/api/plugins/install', { repo, branch, replace, dry_run: dryRun }),
+  pluginsProbe: (name: string) =>
+    getJSON<{ conflict?: boolean; existing?: PluginConflictSide | null; official?: boolean; message?: string }>(
+      '/api/plugins/probe?name=' + encodeURIComponent(name)),
   pluginsCheckUpdates: () => getResult<SimpleMessage>('/api/plugins/check-updates'),
   pluginsProxySave: (body: ProxyInfo) => postJSON<{ proxy?: ProxyInfo }>('/api/plugins/proxy', body),
   pluginConfig: (name: string) => getResult<ConfigDocument>('/api/plugins/' + encodeURIComponent(name) + '/config'),

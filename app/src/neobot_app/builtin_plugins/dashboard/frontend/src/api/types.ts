@@ -128,6 +128,34 @@ export interface Plugin {
   disabled_reason?: string | null;
   /** 是否属于依赖自动禁用（区别于用户手动停用） */
   auto_disabled?: boolean;
+  /** 命令因重名被自动改名：原 /x -> 实际 /plugin__x（spec(4) R26） */
+  command_renames?: PluginCommandRename[];
+}
+
+/** 命令重名导致的自动改名（后端 snapshot.command_renames） */
+export interface PluginCommandRename {
+  requested: string;
+  actual: string;
+  message: string;
+}
+
+/** 插件 ID 冲突的一侧（请求方 / 已存在方） */
+export interface PluginConflictSide {
+  name?: string;
+  version?: string;
+  repo?: string;
+  branch?: string;
+  path?: string;
+  official?: boolean;
+}
+
+/** 插件安装冲突（spec(4) R27/D24）：两侧来源与版本 + 只能二选一 */
+export interface PluginConflict {
+  kind?: 'existing_plugin' | 'official' | string;
+  requested?: PluginConflictSide;
+  existing?: PluginConflictSide;
+  message?: string;
+  reserved?: boolean;
 }
 
 /** 面板 HTTP 扩展 /api/extensions：依赖面板的插件挂在同一端口上的页面 */
@@ -156,10 +184,12 @@ export interface PluginListPayload {
   manage_enabled?: boolean;
   hot_reload?: boolean;
   proxy?: ProxyInfo;
+  /** 插件安装器是否可用 */
+  installer?: boolean;
 }
 
 /** schema 字段描述（由后端 config_manager.describe_dataclass 生成） */
-export type FieldKind = 'scalar' | 'group' | 'list' | 'dict' | 'model_list';
+export type FieldKind = 'scalar' | 'group' | 'list' | 'dict' | 'model_list' | 'model_params';
 
 export interface FieldDescriptor {
   name: string;
@@ -314,6 +344,96 @@ export interface EnvPayload {
   revision?: number;
   message?: string;
   [key: string]: unknown;
+}
+
+/** 计费（spec(4) Part A）：/api/config/billing */
+export interface BillingScriptBinding {
+  model_key: string;
+  billing_script?: string;
+  billing_config?: Record<string, unknown>;
+  source?: string;
+  available?: boolean;
+  error?: string;
+  loaded_at?: string;
+  last_eval_ms?: number;
+  eval_count?: number;
+  [k: string]: unknown;
+}
+
+export interface BillingScriptStatus {
+  name?: string;
+  path?: string;
+  ok?: boolean;
+  error?: string;
+  loaded_at?: string;
+  elapsed_ms?: number;
+  reload_count?: number;
+  last_eval_ms?: number;
+  last_source?: string;
+  eval_count?: number;
+  fallback_count?: number;
+  [k: string]: unknown;
+}
+
+export interface BillingPayload {
+  available?: boolean;
+  enabled?: boolean;
+  timeout_ms?: number;
+  reload_on_change?: boolean;
+  record_detail?: boolean;
+  directory?: string;
+  scripts?: string[];
+  templates?: string[];
+  policies?: Record<string, BillingScriptStatus>;
+  bindings?: BillingScriptBinding[];
+  errors?: Record<string, string>;
+  reloaded?: string[];
+  results?: Record<string, { ok?: boolean; error?: string; path?: string }>;
+  [k: string]: unknown;
+}
+
+export interface BillingPreviewResult {
+  ok?: boolean;
+  cost_cny?: number;
+  builtin_cost_cny?: number;
+  source?: string;
+  components?: Record<string, number>;
+  note?: string;
+  elapsed_ms?: number;
+  error?: string;
+  model_key?: string;
+  billing_script?: string;
+  billing_config?: Record<string, unknown>;
+  enabled?: boolean;
+  occurred_at?: string;
+  local_time?: string;
+  tzname?: string;
+  message?: string;
+  [k: string]: unknown;
+}
+
+/** 最近调用明细 /api/stats/usage/records（来源列与分项） */
+export interface UsageRecordItem {
+  at?: string;
+  module?: string;
+  model_name?: string;
+  provider_name?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_hit_tokens?: number;
+  cache_miss_tokens?: number;
+  cost_cny?: number;
+  cost_source?: string;
+  cost_source_kind?: 'builtin' | 'script' | 'fallback' | string;
+  negative?: boolean;
+  cost_detail?: { components?: Record<string, number>; note?: string; error?: string; raw?: string } | null;
+}
+
+export interface UsageRecordsPayload {
+  available?: boolean;
+  hours?: number;
+  items?: UsageRecordItem[];
+  error?: string;
 }
 
 /** 用量 /api/stats/usage 与 /api/series/usage */
@@ -646,6 +766,11 @@ export interface ArchivesPayload {
   readonly_reason?: string;
   /** 当前会话是否有管理权限（决定能否编辑 / 删除） */
   can_manage?: boolean;
+  /** 档案总结服务是否可用（false 时禁用「AI 压缩」入口） */
+  summarize_available?: boolean;
+  /** 手动压缩目标的下限 / 上限（上限 = max_total_chars，0 时取后端兜底值） */
+  min_target_chars?: number;
+  max_target_chars?: number;
   error?: string;
 }
 
@@ -698,6 +823,80 @@ export interface ArchiveItemQuery {
   limit?: number;
   offset?: number;
   overLimitOnly?: boolean;
+}
+
+/** 一次 AI 压缩任务 / 批量的状态（spec(4) Part C） */
+export interface ArchiveSummarizeBatchItem {
+  table: string;
+  key: string;
+  chars_before?: number;
+  chars_after?: number | null;
+  status?: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+  error?: string;
+  snapshot_id?: number | null;
+}
+
+export interface ArchiveSummarizeTask {
+  ok?: boolean;
+  task_id?: string | null;
+  kind?: 'single' | 'batch';
+  /** running / done / failed；noop = 目标不小于当前字数（零 token，不调用模型） */
+  status?: 'running' | 'done' | 'failed' | 'noop';
+  table?: string;
+  key?: string;
+  target_chars?: number;
+  chars_before?: number;
+  chars_after?: number | null;
+  snapshot_id?: number | null;
+  error?: string;
+  operator_ip?: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  message?: string;
+  noop?: boolean;
+  /** 批量：超出 MAX_BATCH_COMPRESS_ITEMS 而未处理的条数 */
+  truncated?: number;
+  /** 批量：逐条结果 */
+  items?: ArchiveSummarizeBatchItem[];
+  /** 批量：被跳过的条目（chars <= target 或正在被压缩） */
+  skipped?: { table: string; key: string; reason?: string }[];
+  succeeded?: number;
+  failed?: number;
+}
+
+/** 压缩历史里的一份快照（列表不含全文） */
+export interface ArchiveSnapshot {
+  id: number;
+  table_name: string;
+  key: string;
+  total_chars?: number;
+  version?: number;
+  /** manual（面板 / 批量）| auto（写超限自动压缩） */
+  reason?: string;
+  operator_ip?: string | null;
+  created_at?: string;
+  chars_before?: number | null;
+  chars_after?: number | null;
+  /** 压缩后字数的来源：该档案当前字数 / 后一份快照的压缩前字数 */
+  chars_after_source?: 'current' | 'next_snapshot';
+}
+
+export interface ArchiveSnapshotsPayload {
+  ok?: boolean;
+  items?: ArchiveSnapshot[];
+  table?: string;
+  key?: string;
+  current_chars?: number | null;
+  keep_per_key?: number;
+  /** 恒为 false：本期不提供「恢复到此快照」 */
+  restore_supported?: boolean;
+  error?: string;
+}
+
+export interface ArchiveSnapshotDetail {
+  ok?: boolean;
+  snapshot?: ArchiveSnapshot & { value?: string };
+  error?: string;
 }
 
 export interface ArchiveUpdateBody {

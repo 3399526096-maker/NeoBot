@@ -7,7 +7,56 @@ import Icon from '../../components/Icon';
 import Modal from '../../components/Modal';
 import SchemaForm, { defaultsFromFields } from '../../components/SchemaForm';
 import { setPath } from '../../utils/paths';
+import { BillingSection } from './BillingSection';
 import { bindValues } from './shared';
+
+/** 列表行上的计费标签：从完整条目里取 billing_script（留空 = 固定计费）。 */
+function billingScriptOf(item: ModelItem): string {
+  const entry = item.entry as { billing_script?: string } | undefined;
+  return String(entry?.billing_script || '').trim();
+}
+
+/** 参数目录伪字段（settings.params）里携带的可编辑载荷（spec(4) Part B）。 */
+interface ModelParamsPayload {
+  enabled_params?: unknown;
+  extra_body?: unknown;
+  values?: unknown;
+}
+
+/**
+ * 保存前把伪字段同步回真实配置键：
+ * settings.params -> enabled_params / extra_body / 各可选参数值，并删除 params。
+ * 未列入目录的参数名不落盘（后端只记 warning 忽略），避免写成未知配置项。
+ */
+function syncModelParams(
+  entry: Record<string, any>,
+  catalogNames: Set<string>,
+): Record<string, any> {
+  const settings = entry?.settings;
+  if (!settings || typeof settings !== 'object' || !('params' in settings)) return entry;
+  const params = (settings as Record<string, any>).params as ModelParamsPayload | undefined;
+  const nextSettings: Record<string, any> = { ...(settings as Record<string, any>) };
+  delete nextSettings.params;
+  if (params && typeof params === 'object') {
+    if (Array.isArray(params.enabled_params)) {
+      nextSettings.enabled_params = (params.enabled_params as unknown[])
+        .map((name) => String(name))
+        .filter(Boolean);
+    }
+    if (params.extra_body && typeof params.extra_body === 'object') {
+      nextSettings.extra_body = params.extra_body;
+    }
+    const values = params.values;
+    if (values && typeof values === 'object' && !Array.isArray(values)) {
+      for (const [name, value] of Object.entries(values as Record<string, unknown>)) {
+        if (value === undefined) continue;
+        if (catalogNames.has(name)) nextSettings[name] = value;
+      }
+    }
+  }
+  return { ...entry, settings: nextSettings };
+}
+
 function ModelsPanel() {
   const [data, setData] = useState<ModelsPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -37,6 +86,25 @@ function ModelsPanel() {
   const library = data?.library || [];
   const schema = data?.entry_schema || [];
 
+  // 参数目录里的可选参数名（保存时只把目录内的值写回 settings.<name>）
+  const catalogNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const field of schema) {
+      if (field.kind !== 'group' || field.name !== 'settings') continue;
+      for (const child of field.fields || []) {
+        if (child.kind !== 'model_params') continue;
+        for (const item of (child.catalog as Array<{ name?: unknown }>) || []) {
+          if (item?.name) names.add(String(item.name));
+        }
+      }
+    }
+    return names;
+  }, [schema]);
+
+  const editingLibraryItem = editing
+    ? library.find((item) => item.key && item.key === editing.draft?.key)
+    : undefined;
+
   const startNew = () => setEditing({ isNew: true, draft: defaultsFromFields(schema) });
 
   const startEdit = (item: any) => setEditing({ isNew: false, draft: structuredClone(item.entry || {}) });
@@ -46,7 +114,7 @@ function ModelsPanel() {
     setBusy('save');
     const result = await api.modelsLibrarySave({
       action: 'upsert',
-      entry: editing.draft,
+      entry: syncModelParams(editing.draft, catalogNames),
       revision: data?.revision,
       reload,
     });
@@ -137,11 +205,19 @@ function ModelsPanel() {
     return [...new Set(names)].sort((a, b) => a.localeCompare(b));
   }, [pulledProvider, providerModels, currentProvider, library]);
 
-  // 引用名（key）不进表单：新建时按模型名自动生成，已有条目只读展示
+  // 引用名（key）不进表单：新建时按模型名自动生成，已有条目只读展示。
+  // billing_script / billing_config 也不进通用表单：它们由下面的「计费」区专用控件编辑
+  // （脚本是下拉而不是自由文本，且带试算按钮）。
   const fields = useMemo(() => {
     if (!editing) return [];
     return bindValues(schema, editing.draft)
-      .filter((field) => field.name !== 'key' && !field.hidden)
+      .filter(
+        (field) =>
+          field.name !== 'key' &&
+          field.name !== 'billing_script' &&
+          field.name !== 'billing_config' &&
+          !field.hidden,
+      )
       .map((field) => {
         if (field.name === 'provider') return { ...field, options: data?.provider_options || [] };
         if (field.name === 'model_name') return { ...field, options: modelNameOptions };
@@ -216,6 +292,13 @@ function ModelsPanel() {
                   {item.assigned && <span className="tag info">已引用</span>}
                   {item.native_vision && <span className="tag info">原生视觉</span>}
                   {item.use_system_proxy && <span className="tag info">系统代理</span>}
+                  {billingScriptOf(item) ? (
+                    <span className="tag info" title={'计价脚本 ' + billingScriptOf(item)}>
+                      脚本: {billingScriptOf(item)}
+                    </span>
+                  ) : (
+                    <span className="tag" title="未绑定计价脚本：按模型价格表固定计费">固定计费</span>
+                  )}
                 </td>
                 <td>
                   <button className="btn-sm" disabled={!!busy} onClick={() => startEdit(item)}>编辑</button>
@@ -243,12 +326,34 @@ function ModelsPanel() {
               <code>{editing.draft?.key || '保存时按模型名自动生成'}</code>
               <span className="muted"> · 调用方通过它引用该模型，无需手动填写</span>
             </p>
+            {editingLibraryItem?.params_inferred && (
+              <p className="config-notice warning" role="status">
+                <Icon name="more" />
+                已按旧配置推断本模型启用的可选参数（值 ≠ 默认值视为已启用），请复核参数区后保存。
+              </p>
+            )}
             <SchemaForm
               fields={fields}
               disabled={!!busy}
               onChange={(path, value) =>
                 setEditing((previous) =>
                   previous ? { ...previous, draft: setPath(previous.draft, path, value) } : previous,
+                )
+              }
+            />
+            <BillingSection
+              modelKey={editing.draft?.key}
+              script={String(editing.draft?.billing_script || '')}
+              config={(editing.draft?.billing_config || {}) as Record<string, unknown>}
+              disabled={!!busy}
+              onChangeScript={(value) =>
+                setEditing((previous) =>
+                  previous ? { ...previous, draft: { ...previous.draft, billing_script: value } } : previous,
+                )
+              }
+              onChangeConfig={(value) =>
+                setEditing((previous) =>
+                  previous ? { ...previous, draft: { ...previous.draft, billing_config: value } } : previous,
                 )
               }
             />

@@ -339,13 +339,19 @@ class DashboardServer:
         self._route(app, "GET", "/api/stats/api-calls", self.api.stats_api_calls)
         self._route(app, "GET", "/api/stats/active-users", self.api.stats_active_users)
         self._route(app, "GET", "/api/stats/usage", self.api.stats_usage)
+        self._route(app, "GET", "/api/stats/usage/records", self.api.stats_usage_records)
         self._route(app, "GET", "/api/series/usage", self.api.series_usage)
+        # spec(4) Part A：可脚本化的消耗计费
+        self._route(app, "GET", "/api/config/billing", self.api.config_billing)
+        self._route(app, "POST", "/api/config/billing/reload", self.api.config_billing_reload)
+        self._route(app, "POST", "/api/config/billing/preview", self.api.config_billing_preview)
         self._route(app, "GET", "/api/logs", self.api.logs)
         self._route(app, "GET", "/api/tasks", self.api.tasks)
         self._route(app, "GET", "/api/services", self.api.services)
 
         self._route(app, "GET", "/api/plugins", self.api.plugins)
         self._route(app, "POST", "/api/plugins/install", self.api.plugins_install)
+        self._route(app, "GET", "/api/plugins/probe", self.api.plugins_probe)
         self._route(app, "POST", "/api/plugins/proxy", self.api.plugins_proxy_save)
         self._route(app, "GET", "/api/plugins/check-updates", self.api.plugins_check_updates)
         self._route(app, "POST", "/api/plugins/{name}/toggle", self.api.plugin_toggle)
@@ -386,6 +392,17 @@ class DashboardServer:
         self._route(app, "GET", "/api/archives/item", self.api.archive_item)
         self._route(app, "PUT", "/api/archives/item", self.api.archive_update)
         self._route(app, "DELETE", "/api/archives/item", self.api.archive_delete)
+        # ── AI 压缩（features/spec(4) Part C）──
+        self._route(app, "POST", "/api/archives/summarize", self.api.archives_summarize_start)
+        self._route(app, "GET", "/api/archives/summarize", self.api.archives_summarize_status)
+        self._route(
+            app,
+            "POST",
+            "/api/archives/summarize/over-limit",
+            self.api.archives_summarize_over_limit,
+        )
+        self._route(app, "GET", "/api/archives/snapshots", self.api.archives_snapshots)
+        self._route(app, "GET", "/api/archives/snapshot", self.api.archives_snapshot)
         self._route(app, "GET", "/api/scheduled-tasks", self.api.scheduled_tasks)
         self._route(app, "POST", "/api/scheduled-tasks/action", self.api.scheduled_tasks_action)
         self._route(app, "GET", "/api/admin/power", self.api.power_status)
