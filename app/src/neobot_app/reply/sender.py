@@ -17,6 +17,7 @@ from neobot_contracts.time_context import now_utc
 
 from neobot_app.reply.debug import DebugHelper
 from neobot_app.reply.event import ReplyState
+from neobot_app.reply.output_guard import clean_segments, clean_text, should_drop
 from neobot_app.reply.postprocess import process_reply_text
 from neobot_app.utils.media_sender import prepare_image_segment, send_image
 from neobot_app.time_context import monotonic_seconds
@@ -232,7 +233,14 @@ class ReplySender:
         images: list[int] | None = None,
         merge_text_with_image: bool = False,
         self_sent: SelfSentSink | None = None,
-    ) -> None:
+        sender_names: list[str] | None = None,
+    ) -> bool:
+        """发送一段回复；返回是否真的发出了内容。
+
+        返回 False 只出现在「清洗后什么都不剩」这一种情况：整条都是系统标注残渣
+        （或未闭合的思维链），此时宁可不发，也不把空消息/脏前缀发到群里。
+        调用方（工具层）据此告诉模型重新生成正文，而不是误报「已发送」。
+        """
         before_postprocess = await self._debug_helper.emit_runtime_event(
             "reply.postprocess.before",
             event,
@@ -245,6 +253,10 @@ class ReplySender:
         segments = before_postprocess.payload.get("segments", segments)
         send_original = bool(before_postprocess.payload.get("send_original", send_original))
         images = before_postprocess.payload.get("images", images)
+        # 输出兜底清洗：不动 text/segments 之外的东西，且这里的 text 就是
+        # self-sent 写回历史的文本（见下方 _emit_self_sent_text），因此正反馈
+        # 的源头也在这里被切断（详见 reply/output_guard.py）。
+        text, segments = self._sanitize_outgoing(text, segments, sender_names=sender_names)
         before_send = await self._debug_helper.emit_runtime_event(
             "reply.send.before",
             event,
@@ -261,13 +273,25 @@ class ReplySender:
                 event.transition(ReplyState.COMPLETED)
             except RuntimeError:
                 pass
-            return
+            return True
         text = str(before_send.payload.get("text", text))
         segments = before_send.payload.get("segments", segments)
         send_original = bool(before_send.payload.get("send_original", send_original))
         images = before_send.payload.get("images", images)
         reply_to_message_id = before_send.payload.get("reply_to_message_id", reply_to_message_id)
         mention_user_ids = before_send.payload.get("mention_user_ids", mention_user_ids)
+        # 插件可能在 reply.send.before 里改写文本，清洗必须在改写之后再做一次，
+        # 否则「最后一道兜底」会被插件绕过。清洗幂等，重复调用无副作用。
+        text, segments = self._sanitize_outgoing(text, segments, sender_names=sender_names)
+        if not (str(text or "").strip() or segments or images):
+            self._logger.warning(
+                "回复清洗后为空，已丢弃发送",
+                conversation=f"{event.conversation_ref.kind}:{event.conversation_ref.id}"
+                if event.conversation_ref is not None
+                else "",
+            )
+            self._leave_sending(event, event.conversation_ref.kind if event.conversation_ref else "")
+            return False
 
         self._enter_sending(event)
         conv_ref = event.conversation_ref
@@ -313,7 +337,7 @@ class ReplySender:
                 formatted=formatted_messages[0] if len(formatted_messages) == 1 else formatted_messages,
                 reply_to_message_id=reply_to_message_id,
             )
-            return
+            return True
 
         # Phase A: send images first (one by one)
         if images:
@@ -349,11 +373,25 @@ class ReplySender:
                     event.send_response = send_results[0]
                     self._leave_sending(event, conv_ref.kind)
                     self._debug_helper.record("reply_sent_as_markdown_image", event, text_len=len(text), image_path=str(image_path))
-                    return
+                    return True
                 except Exception as exc:
                     self._logger.warning("Markdown 图片渲染失败，降级为文本发送", error=str(exc))
 
         # Phase C: send text (segmented, with cooldown)
+        # 已经发过图片、且清洗后没有任何文字可发时，直接收尾：
+        # 不要为了「走完流程」再发一条空文本消息（审查实测：空 data.text 会真的上线）。
+        if images and not str(text or "").strip() and not segments:
+            event.send_response = (
+                send_results[0] if len(send_results) == 1 else send_results
+            )
+            self._leave_sending(event, conv_ref.kind)
+            self._debug_helper.record(
+                "reply_sent",
+                event,
+                formatted=formatted_messages,
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
         reply_messages = self._build_reply_messages(
             text,
             segments=segments,
@@ -368,6 +406,18 @@ class ReplySender:
             send_original=send_original,
         )
         reply_messages = list(after_postprocess.payload.get("reply_messages", reply_messages))
+        # 插件也能在 reply.postprocess.after 改写逐条内容，而这一步在清洗之后：
+        # 再清一遍，保证「最后一道兜底」不被插件绕过（清洗幂等，重复调用无副作用）。
+        reply_messages = clean_segments(
+            reply_messages, known_sender_names=self._sender_names(sender_names)
+        )
+        if not reply_messages and not images:
+            self._logger.warning(
+                "回复清洗后为空，已丢弃发送",
+                conversation=f"{conv_ref.kind}:{conv_ref.id}",
+            )
+            self._leave_sending(event, conv_ref.kind)
+            return False
         is_group = conv_ref.kind == "group"
         pipeline_key = f"{conv_ref.kind}:{conv_ref.id}"
 
@@ -406,6 +456,7 @@ class ReplySender:
             formatted_messages=formatted_messages,
             send_results=send_results,
         )
+        return True
 
     # ── self-sent message tracking ──────────────────────────────
     #
@@ -684,6 +735,55 @@ class ReplySender:
 
     # ── internals ───────────────────────────────────────────────
 
+    def _sanitize_outgoing(
+        self,
+        text: str,
+        segments: list[str] | None,
+        *,
+        sender_names: list[str] | None = None,
+    ) -> tuple[str, list[str] | None]:
+        """发送前的统一清洗入口（text 与 segments 两条路径共用同一套规则）。
+
+        `segments` 路径此前完全跳过清洗（只有 text 路径跑 process_reply_text），
+        这里把「前缀标注 / <think> 标签」的清洗补齐到两条路径上：同一个模型输出
+        不该因为走哪条路径而有不同的清洗结果。
+
+        text 与 segments 都清洗后为空时，text 退化为空串 —— 由调用方跳过发送，
+        绝不把一段空消息当作「已回复」发出去。
+        """
+        names = self._sender_names(sender_names)
+        # text 与 segments 一律都清洗：segments 存活时 text 也不能放过 ——
+        # send_original=true 会让 _build_reply_messages 选中 text，脏 text 会直通线上。
+        cleaned_text = self._clean_text_only(text, names)
+        if segments:
+            kept = clean_segments(segments, known_sender_names=names)
+            if kept:
+                return cleaned_text, kept
+            if cleaned_text:
+                # segments 全是残渣时只保留 text（已清洗），而不是发出空消息
+                return cleaned_text, None
+            return "", None
+        return cleaned_text, segments
+
+    @staticmethod
+    def _clean_text_only(text: str, sender_names: list[str]) -> str:
+        original = str(text or "")
+        cleaned = clean_text(original, known_sender_names=sender_names)
+        if should_drop(original, cleaned, known_sender_names=sender_names):
+            return ""
+        return cleaned
+
+    def _sender_names(self, extra: list[str] | None) -> list[str]:
+        """收集「我自己可能长什么样」的名字集合（配置昵称 + 队列里用过的显示名）。"""
+        names: list[str] = []
+        seen: set[str] = set()
+        for value in [self._bot_name, *list(extra or [])]:
+            name = str(value or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
     def _build_reply_messages(
         self,
         text: str,
@@ -692,7 +792,14 @@ class ReplySender:
         send_original: bool = False,
     ) -> list[str]:
         if send_original:
-            return [text.strip()]
+            # text 被清洗成空时不要返回 [""]（那会发出一条空消息），
+            # 退回 segments / 交由调用方判空跳过（见 send_reply 的空判）。
+            stripped = text.strip()
+            if stripped:
+                return [stripped]
+            if segments:
+                return [s.strip() for s in segments if s.strip()]
+            return []
         if segments:
             cleaned = [s.strip() for s in segments if s.strip()]
             if cleaned:
