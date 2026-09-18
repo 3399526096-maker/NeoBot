@@ -2987,6 +2987,24 @@ class ReplyOrchestrator:
                             else str(content)
                         )
                         if text:
+                            # 「AI 回复检查」追问之后，模型必须**用工具**表态
+                            # （send_reply 或 cancel，见 _build_ai_reply_check_prompt）。
+                            # 若它没发起任何工具调用、只回了正文，那段正文是它对草稿的
+                            # **斟酌**而不是要说的话 —— 实测泄漏样本："或者就这句？简短自然"。
+                            # 这里绝不把它当回复发送：发送等于把内心话贴到群里。
+                            if ai_check_prompted:
+                                self._logger.warning(
+                                    "AI 回复检查后模型未用工具表态，已丢弃其正文以免泄漏草稿",
+                                    event_id=event.event_id,
+                                    reply_text=text[:200],
+                                )
+                                self._record_debug(
+                                    "ai_reply_check_without_tool_call",
+                                    event,
+                                    queue_key=queue_key,
+                                    reply_text=text,
+                                )
+                                break
                             full_check = self._get_ai_reply_check()
                             light_check = self._get_ai_reply_check_lightweight()
                             need_check = full_check

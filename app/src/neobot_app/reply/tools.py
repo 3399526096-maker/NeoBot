@@ -22,7 +22,11 @@ from neobot_chat.schema.types import (
 )
 from neobot_chat.tools.toolset import ToolSpec, Toolset
 from neobot_contracts.ports.logging import Logger, NullLogger
-from neobot_app.reply.output_guard import clean_segments, clean_text
+from neobot_app.reply.output_guard import (
+    clean_segments,
+    clean_text,
+    is_control_token_only,
+)
 from neobot_app.reply.postprocess import (
     ReplyPostProcessResult,
     build_over_limit_guidance,
@@ -31,34 +35,6 @@ from neobot_app.reply.postprocess import (
 )
 from neobot_app.skills.activation import SkillToolActivation
 from neobot_app.time_context import monotonic_seconds
-
-
-#: 「模型把工具名当成正文发出去」的判定用字符集：两端可能带引号/括号/句读。
-_CANCEL_TOKEN = "cancel"
-_CANCEL_TRIM = (
-    " \t\r\n"
-    "\"'“”‘’「」『』()（）[]【】<>"
-    "。，、.,;；:：!！?？~～-—_…*`"
-)
-
-
-def _is_bare_cancel_token(text: str) -> bool:
-    """整条正文是否**恰好**是 ``cancel`` 这个工具名。
-
-    用来拦一个真实故障：模型想取消本轮回复时，会先 ``send_reply("cancel")``
-    再调用 ``cancel`` 工具 —— 而 ``send_reply`` 是立即发送的，群里就先冒出一条
-    内容为 ``cancel`` 的消息，``cancel`` 又无法把它撤回。
-
-    精度上的取舍（宁可漏拦，不可误伤）：
-
-    * **只认整条等值**：``cancel 是什么意思``、``为什么不 cancel`` 这类正常回复
-      一律不命中；
-    * **只认英文工具名**：不拦「取消」等中文词 —— 那完全可能是正常回复
-      （对方问「取消吗」，答「取消」）；
-    * 调用方还会额外要求「没有 segments / images / send_original」，
-      避免拦掉带图回复或用户明确要求原样发送的内容。
-    """
-    return text.strip().strip(_CANCEL_TRIM).strip().lower() == _CANCEL_TOKEN
 
 
 # 技能激活限制工具（allowed-tools）时始终可用的基础工具白名单。
@@ -1633,12 +1609,15 @@ class ReplyToolExecutor(ToolExecutor):
         # cancel 工具，而 send_reply 是立即发送、cancel 又撤不回，群里就会多出一条
         # 莫名其妙的 "cancel"。这里返回**可执行的错误**而不是静默丢弃：模型才知道
         # 自己没发出去，从而改调 cancel 工具或重写正文。
+        # 注意：这只覆盖工具路径。模型也可能**不调用任何工具**、直接把 "cancel"
+        # 当正文返回（实测 tool_calls=[]），那条路走 orchestrator 的兜底发送，
+        # 由 sender 层的同一条判定兜住（见 output_guard.is_control_token_only）。
         if (
             self._cancel is not None
             and not segments
             and not args.get("images")
             and args.get("send_original") is not True
-            and _is_bare_cancel_token(text)
+            and is_control_token_only(text)
         ):
             return (
                 "已拦截：正文只有 \"cancel\"，它是工具名、不是要发出去的话——本条未发送。"

@@ -381,6 +381,39 @@ def should_drop(
     return stripper.is_annotation_only(str(cleaned or ""))
 
 
+#: 控制词：模型偶尔会把**工具名**当成正文写出来。
+#:
+#: 实测形态是 `content == 'cancel'` 且 `tool_calls == []` —— 模型想取消本轮回复，
+#: 却没发起工具调用，于是走了 orchestrator 里「无工具调用但有正文」的兜底发送路径
+#: （`reply/orchestrator.py` 的 `if not tool_calls:` 分支）。那条路径**不经过**
+#: `send_reply` 工具，所以只打在工具层的兜底拦不到它。
+#:
+#: 判定收敛到这里的理由：`_clean_text_only` 是 text 与 segments 两条路径共用的
+#: 清洗出口，任何发送路径都必经此处，是唯一不会漏的地方。
+_CONTROL_TOKENS = frozenset({"cancel"})
+
+#: 两端可能带的引号/括号/句读（`「cancel」`、`cancel。` 都算同一个词）
+_CONTROL_TRIM = (
+    " \t\r\n"
+    "\"'“”‘’「」『』()（）[]【】<>"
+    "。，、.,;；:：!！?？~～-—_…*`"
+)
+
+
+def is_control_token_only(text: str) -> bool:
+    """整条内容是否**恰好**只是一个控制词（如 ``cancel``）。
+
+    精度取舍（宁可漏拦，不可误伤）：
+
+    * **只认整条等值**：``cancel 是什么意思``、``为什么不 cancel`` 这类正常回复不命中；
+    * **只认英文工具名**：不拦「取消」等中文词 —— 对方问「取消吗」答「取消」是正常回复；
+    * 与 ``should_drop`` 的区别：那条要求原文含系统标注，而控制词本身没有标注，
+      所以必须单独判一次。
+    """
+    stripped = str(text or "").strip().strip(_CONTROL_TRIM).strip()
+    return bool(stripped) and stripped.lower() in _CONTROL_TOKENS
+
+
 def clean_segments(
     segments: list[str] | tuple[str, ...] | None,
     *,

@@ -17,7 +17,12 @@ from neobot_contracts.time_context import now_utc
 
 from neobot_app.reply.debug import DebugHelper
 from neobot_app.reply.event import ReplyState
-from neobot_app.reply.output_guard import clean_segments, clean_text, should_drop
+from neobot_app.reply.output_guard import (
+    clean_segments,
+    clean_text,
+    is_control_token_only,
+    should_drop,
+)
 from neobot_app.reply.postprocess import process_reply_text
 from neobot_app.utils.media_sender import prepare_image_segment, send_image
 from neobot_app.time_context import monotonic_seconds
@@ -768,6 +773,11 @@ class ReplySender:
     @staticmethod
     def _clean_text_only(text: str, sender_names: list[str]) -> str:
         original = str(text or "")
+        # 控制词兜底（如正文恰好是 "cancel"）：模型会把工具名当正文写出来，
+        # 而 orchestrator 的「无工具调用但有正文」兜底会把它直接送到这里。
+        # 归零后由 send_reply 的判空分支丢弃整条，不会发出去。
+        if is_control_token_only(original):
+            return ""
         cleaned = clean_text(original, known_sender_names=sender_names)
         if should_drop(original, cleaned, known_sender_names=sender_names):
             return ""
