@@ -2663,9 +2663,23 @@ class DashboardApi:
         denied = self._require_manage(request)
         if denied is not None:
             return denied
-        application = self._service("application")
-        restart = getattr(application, "request_restart", None) if application is not None else None
-        if not callable(restart):
+        # 优先用**与运行时生命周期无关**的核心重启信号：待机时 application 为 None、
+        # 重建失败时注册表里是已停止的旧对象，打在它上面入口循环永远看不到，
+        # 用户点了「重启进程」却毫无反应（曾导致待机后无法恢复）。
+        restart: Any = None
+        signal = self._service("process_restart")
+        if signal is not None and callable(getattr(signal, "request", None)):
+            restart = signal.request
+        if restart is None:
+            application = self._service("application")
+            candidate = (
+                getattr(application, "request_restart", None)
+                if application is not None
+                else None
+            )
+            if callable(candidate):
+                restart = candidate
+        if restart is None:
             return _json_error("重启入口不可用，请手动重启 NeoBot", status=503)
         self.logger.warning(f"面板请求重启 NeoBot ip={self.console.request_ip(request)}")
         asyncio.get_running_loop().call_later(0.5, restart)

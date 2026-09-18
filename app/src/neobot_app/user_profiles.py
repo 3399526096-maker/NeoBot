@@ -9,7 +9,12 @@ from typing import Any, Optional
 
 from neobot_contracts.ports.logging import Logger, NullLogger
 
-from neobot_app.favorability import favorability_to_text
+from neobot_app.favorability import (
+    FAVORABILITY_MAX,
+    FAVORABILITY_MIN,
+    clamp_favorability,
+    favorability_to_text,
+)
 from neobot_app.time_context import now_utc, to_utc
 
 
@@ -109,6 +114,60 @@ class UserProfileService:
             await uow.profiles.upsert_user(user_id_str, avatar_analysis=avatar_text)
             await uow.commit()
             return await uow.profiles.get_user(user_id_str)
+
+    async def update_favorability(
+        self,
+        user_id: str | int,
+        change: int,
+        *,
+        reason: str = "",
+        max_change: int = 5,
+        min_value: int = FAVORABILITY_MIN,
+        max_value: int = FAVORABILITY_MAX,
+    ) -> dict[str, Any]:
+        """按**增量**调整好感度——favorability Skill 依赖的契约。
+
+        与下面的 :meth:`update_user_favorability`（直接设定绝对值）不同：
+
+        1. 先把 ``change`` 限幅到 ±``max_change``，避免模型一次把好感度拉满；
+        2. 再把结果 clip 到 ``[min_value, max_value]``（复用 ``clamp_favorability``）；
+        3. 返回变更前后与等级文案，让模型能回读自己到底改了多少
+           （``change`` 是**实际生效**的增量，触顶时为 0）。
+
+        ``reason`` 只写日志，不落库——用户档案里没有存放变更原因的字段。
+        """
+        user_id_str = str(user_id)
+        try:
+            requested = int(change)
+        except (TypeError, ValueError):
+            requested = 0
+        limit = max(0, int(max_change))
+        delta = max(-limit, min(limit, requested))
+
+        async with self._uow_factory() as uow:
+            record = await uow.profiles.get_user(user_id_str)
+            before = int(getattr(record, "favorability", 0) or 0)
+            after = clamp_favorability(before + delta, min_val=min_value, max_val=max_value)
+            await uow.profiles.upsert_user(user_id_str, favorability=after)
+            await uow.commit()
+
+        effective = after - before
+        self._logger.info(
+            "好感度已调整",
+            user_id=user_id_str,
+            before=before,
+            after=after,
+            change=effective,
+            reason=reason,
+        )
+        return {
+            "user_id": user_id_str,
+            "before": before,
+            "after": after,
+            "change": effective,
+            "label": favorability_to_text(after),
+            "reason": reason,
+        }
 
     async def update_user_favorability(
         self,

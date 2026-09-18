@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -18,6 +19,13 @@ from neobot_contracts.ports.logging import Logger, NullLogger
 
 #: 运行时工厂：返回一个具备 start()/stop()（以及可选 request_restart()）的对象
 RuntimeFactory = Callable[[], Any]
+
+#: 停止 bot 运行时的上限。适配器接收器在极端情况下会卡住（现场日志：软重启停在
+#: 「正在停止接收器…」），而 `application.stop()` 自身没有任何超时，会把整个软重启
+#: 拖死、`_transition` 永久为真、后续所有电源操作被拒。
+#: 超时后按「已停止」继续重建：用户要的是能把服务重启回来，残留的守护线程
+#: 由进程退出回收（与适配器接收器自带的兜底超时同一思路）。
+STOP_TIMEOUT_SECONDS = 20.0
 
 
 class StandbyController:
@@ -31,6 +39,7 @@ class StandbyController:
         adapter: Any = None,
         logger: Logger | None = None,
         initial_application: Any = None,
+        restart_signal: Any = None,
     ) -> None:
         self._standby = standby_service
         self._factory = runtime_factory
@@ -39,6 +48,8 @@ class StandbyController:
         self._app: Any | None = None
         self._initial = initial_application
         self._adapter_running = False
+        #: 核心持有的进程重启信号（见 runtime/process_restart.py）
+        self._restart_signal = restart_signal
 
     @property
     def application(self) -> Any | None:
@@ -76,7 +87,7 @@ class StandbyController:
         application, self._app = self._app, None
         self._adapter_running = False
         if application is not None:
-            await application.stop()
+            await self._stop_runtime(application)
         await self._sync_adapter(desired=bool(self._standby.connect_onebot))
         return True, "bot 运行时已停止：只保留面板、配置与命令，/reboot 可软重启运行。"
 
@@ -85,7 +96,7 @@ class StandbyController:
         application, self._app = self._app, None
         self._adapter_running = False
         if application is not None:
-            await application.stop()
+            await self._stop_runtime(application)
         await self._start_runtime()
         return True, "已按当前配置软重启运行（进程未重启，面板未断线）。"
 
@@ -102,9 +113,13 @@ class StandbyController:
     def request_process_restart(self) -> bool:
         """请求进程级重启（加载代码改动）。
 
-        待机时 bot 运行时不存在，进程重启信号由核心持有的共享对象负责
-        （接线见组合根）；此处只报告「本控制器无法处理」。
+        优先走**核心持有的共享信号**：待机时 bot 运行时不存在（`_app is None`），
+        重建失败时引用也已被摘掉，两种情况都拿不到可用的 `application`；
+        而共享信号与运行时生命周期无关，cli 入口循环在待机分支同样会检查它。
         """
+        if self._restart_signal is not None:
+            self._restart_signal.request()
+            return True
         if self._app is None:
             return False
         request = getattr(self._app, "request_restart", None)
@@ -114,6 +129,20 @@ class StandbyController:
         return True
 
     # ── 内部 ────────────────────────────────────────────────
+
+    async def _stop_runtime(self, application: Any) -> None:
+        """停止运行时；**带超时**，超时按「已停止」继续。
+
+        不带超时的话，stop 里任何一步卡住（接收器停止见过）都会让
+        `resume()` 永不返回 → `_transition` 永久为真 → 后续所有电源操作被拒。
+        """
+        try:
+            await asyncio.wait_for(application.stop(), timeout=STOP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            self._logger.error(
+                f"停止 bot 运行时超时（{STOP_TIMEOUT_SECONDS:.0f}s），按已停止继续重建；"
+                "残留的后台线程将由进程退出回收"
+            )
 
     async def _start_runtime(self) -> None:
         application = self._factory()

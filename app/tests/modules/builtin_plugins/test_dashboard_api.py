@@ -573,6 +573,62 @@ def test_env_manager_keeps_secret_when_value_blank(tmp_path: Path) -> None:
     assert "DeepSeek_APIKey=sk-updated" in env_path.read_text(encoding="utf-8")
 
 
+def test_env_manager_marks_in_file_and_lets_builtin_be_deleted(tmp_path: Path) -> None:
+    """`in_file` 区分「文件里真的有」与「schema 占位」；两者都支持删除。
+
+    回归背景：面板以前用 `builtin` 决定是否渲染删除按钮，于是内置平台
+    （DeepSeek_* 等）**明明在 .env 里却无法从界面删除**；而把值清空只会留下
+    `KEY=` 空行，用户看到的就是「删了但文件里还在」。
+    """
+    from neobot_app.builtin_plugins.dashboard.config_manager import EnvFileManager
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "DeepSeek_URL=https://api.deepseek.com\n"
+        "DeepSeek_APIKey=sk-deepseek\n"
+        "MyProvider_URL=https://example.com\n",
+        encoding="utf-8",
+    )
+    manager = EnvFileManager(env_path=env_path, backup_dir=tmp_path / "backup")
+
+    items = {item["key"]: item for item in manager.read(mask=True)["items"]}
+    assert items["DeepSeek_URL"]["in_file"] is True
+    assert items["MyProvider_URL"]["in_file"] is True
+    # schema 声明但文件里没有的键是占位项：in_file=False，界面上不给删除按钮
+    placeholders = [item for item in items.values() if not item["in_file"]]
+    assert placeholders, "应当存在 schema 占位项"
+    assert all(item["builtin"] for item in placeholders)
+
+    # 内置键同样能删（后端一直支持，是面板没给入口）
+    manager.save(deletes=["DeepSeek_URL", "DeepSeek_APIKey", "MyProvider_URL"])
+    text = env_path.read_text(encoding="utf-8")
+    assert "DeepSeek" not in text
+    assert "MyProvider" not in text
+
+
+async def test_env_delete_via_api_removes_line(panel) -> None:
+    """端到端：走 HTTP 删除内置键，.env 里对应行必须消失。"""
+    server, _, base, _ = panel
+    env_path = server.env_manager.env_path
+    env_path.write_text(
+        "DeepSeek_URL=https://api.deepseek.com\nMyProvider_URL=https://example.com\n",
+        encoding="utf-8",
+    )
+    token, csrf = await _login(base)
+    async with httpx.AsyncClient() as client:
+        listed = await client.get(base + "/api/config/env", headers={"X-Token": token})
+        response = await client.post(
+            base + "/api/config/env",
+            headers={"X-Token": token, "X-CSRF-Token": csrf},
+            json={"deletes": ["DeepSeek_URL"], "revision": listed.json()["revision"]},
+        )
+
+    assert response.status_code == 200, response.text
+    text = env_path.read_text(encoding="utf-8")
+    assert "DeepSeek_URL" not in text
+    assert "MyProvider_URL" in text
+
+
 async def test_env_add_platform_writes_url_and_key(panel) -> None:
     """一键添加 API 供应商：写入 <平台名>_URL 与 <平台名>_APIKey，响应不含明文 Key。"""
     server, _, base, _ = panel

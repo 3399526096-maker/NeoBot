@@ -37,6 +37,12 @@ OneBotAction = Callable[[bool], Awaitable[tuple[bool, str]]]
 #: set_hooks 的「未传入」哨兵：与显式传入 None（清除钩子）区分开
 _UNSET: Any = object()
 
+#: 软重启重建（on_resume）的整体上限——看门狗。
+#: 没有它时，一旦重建内部卡住（现场日志：卡在「正在停止接收器…」），
+#: `_transition` 会永久停在 True，之后**所有**电源操作都被
+#: 「运行时正在重建中，请稍候」拒绝，用户只剩手动重启进程一条路。
+DEFAULT_RESUME_TIMEOUT_SECONDS = 120.0
+
 
 class StandbyService:
     """待机状态机（单事件循环内使用，动作在锁内串行）。"""
@@ -51,6 +57,7 @@ class StandbyService:
         on_enter: StandbyAction | None = None,
         on_resume: StandbyAction | None = None,
         on_onebot_change: OneBotAction | None = None,
+        resume_timeout: float = DEFAULT_RESUME_TIMEOUT_SECONDS,
     ) -> None:
         self._logger = logger or NullLogger()
         self._state_path = Path(state_path) if state_path is not None else None
@@ -63,6 +70,8 @@ class StandbyService:
         self._on_resume = on_resume
         self._on_onebot_change = on_onebot_change
         self._lock = asyncio.Lock()
+        #: 重建看门狗上限（秒）；<=0 表示不设上限
+        self._resume_timeout = float(resume_timeout)
         #: 迁移（进入待机 / 软重启）进行中：期间拒绝新的迁移请求，避免排队重建
         self._transition = False
         self._restore()
@@ -211,7 +220,7 @@ class StandbyService:
                 self._persist()
                 if self._on_resume is not None:
                     try:
-                        ok, detail = await self._on_resume()
+                        ok, detail = await self._call_resume()
                     except asyncio.CancelledError:
                         self._persist()
                         raise
@@ -267,6 +276,27 @@ class StandbyService:
             if enabled:
                 return True, "待机期将保持与 OneBot 的连接（QQ 命令仍可用）。"
             return True, "待机期已断开与 OneBot 的连接（仅面板可用）。"
+
+    async def _call_resume(self) -> tuple[bool, str]:
+        """带看门狗地执行重建。
+
+        卡住时**按时失败**，而不是把 `_transition` 永久留在 True —— 否则后续
+        每一次电源操作都会被「运行时正在重建中，请稍候」拒绝，用户再也无法重试，
+        只能重启进程（而旧实现连重启进程都是空操作）。
+        """
+        if self._resume_timeout <= 0 or self._on_resume is None:
+            return await self._on_resume()
+        try:
+            return await asyncio.wait_for(self._on_resume(), timeout=self._resume_timeout)
+        except asyncio.TimeoutError:
+            self._logger.error(
+                "软重启重建超时，已中止并回到待机",
+                timeout_seconds=self._resume_timeout,
+            )
+            return False, (
+                f"重建超时（超过 {self._resume_timeout:.0f}s），已中止并回到待机；"
+                "可重试「软重启运行」，或改用「重启进程」。"
+            )
 
     # ── 持久化 ──────────────────────────────────────────────
 

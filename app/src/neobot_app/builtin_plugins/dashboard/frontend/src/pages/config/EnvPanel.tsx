@@ -160,9 +160,7 @@ function EnvPanel() {
                     {item.has_value ? '已设置' : '未设置'}
                   </span>
                 )}
-                {item.builtin ? (
-                  <span className="muted small">内置</span>
-                ) : (
+                {item.in_file ? (
                   <button
                     className="btn-sm danger"
                     disabled={!!busy || removed}
@@ -173,6 +171,8 @@ function EnvPanel() {
                   >
                     删除
                   </button>
+                ) : (
+                  <span className="muted small">未写入 .env</span>
                 )}
               </span>
             </div>
