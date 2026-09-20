@@ -15,7 +15,9 @@ import pytest
 
 from neobot_app.reply.output_guard import (
     clean_segments,
+    clean_text,
     is_control_token_only,
+    is_markup_only,
     is_reply_intent_only,
 )
 from neobot_app.reply.sender import ReplySender
@@ -151,3 +153,70 @@ def test_intent_segment_does_not_take_normal_segments_with_it() -> None:
 
 def test_sender_drops_intent_only_text() -> None:
     assert ReplySender._clean_text_only("不需要插话，取消这条回复。", []) == ""
+
+
+# ── '**' 泄漏：分句器剥掉括号内容后留下的孤儿标记 ─────────────────
+#
+# 实测（群 1107122685，2026-09-20 20:51）：
+#   模型 content = '*（取消回复）*'
+#   clean_text  不动它 → 分句结果变成 ['**'] → 两个星号发进群
+#   （群里当成被屏蔽的脏话，bot 随后解释"是手滑打出来的两个星号"）
+# 也就是说 **模型没有输出 '**'**，是我们的管线剥掉内容后留下的空壳。
+
+
+def test_intent_wrapped_in_italic_and_parens_is_detected() -> None:
+    """斜体 + 括号包裹的取消意图也要认出来。"""
+    assert is_reply_intent_only("*（取消回复）*") is True
+    assert is_reply_intent_only("（取消回复）") is True
+    assert is_reply_intent_only("**不需要插话**") is True
+
+
+def test_wrapped_intent_is_dropped_by_sender() -> None:
+    """意图判定在 sender 层（clean_text 只是清洗器，不做发送策略）。
+
+    注意分工：`clean_text` 负责剥标注/思考标签；「这条该不该发」由
+    `ReplySender._clean_text_only` 与 `clean_segments` 决定。
+    """
+    assert ReplySender._clean_text_only("*（取消回复）*", []) == ""
+
+
+def test_splitter_output_of_wrapped_intent_is_dropped() -> None:
+    """实测链路：分句器把 '*（取消回复）*' 切成 ['**']，这个空壳必须被丢掉。
+
+    这是 '**' 发进群的直接原因 —— 模型并没有输出这两个星号。
+    """
+    from neobot_app.reply.postprocess import process_reply_text
+
+    result = process_reply_text(
+        "*（取消回复）*", bot_name="x", max_length=500, max_sentence_count=10
+    )
+    assert result.messages == ["**"]          # 分句器的现状（保留现状，不在此处改）
+    assert clean_segments(result.messages) == []   # 但发送前会被清空
+
+
+def test_wrapped_intent_segment_is_dropped() -> None:
+    assert clean_segments(["*（取消回复）*", "真的取消了吗"]) == ["真的取消了吗"]
+
+
+@pytest.mark.parametrize("text", ["**", "*", "__", "~~", "  **  ", "***"])
+def test_markup_only_text_is_dropped(text: str) -> None:
+    assert is_markup_only(text) is True
+    assert clean_text(text) == ""
+
+
+@pytest.mark.parametrize("text", ["```", "```text", "---", "。", "1"])
+def test_fences_and_punctuation_are_not_treated_as_markup(text: str) -> None:
+    """代码围栏与标点必须保留。
+
+    `` ``` `` 是代码块的分隔符，分句器会把一个代码块切成多段、围栏自成一段；
+    误删会破坏正文。标点/数字同理（`should_drop` 的既有原则）。
+    这个假阳性是被现有测试 test_output_guard_followup 抓出来的。
+    """
+    assert is_markup_only(text) is False
+
+
+@pytest.mark.parametrize("text", ["*你好呀*", "**重点**", "好哦", "a*b"])
+def test_text_with_markup_is_kept(text: str) -> None:
+    """有文字就必须保留 —— 不能让防标记垃圾的判断误伤正常 markdown。"""
+    assert is_markup_only(text) is False
+    assert clean_text(text) == text

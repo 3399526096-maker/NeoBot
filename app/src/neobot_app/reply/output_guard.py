@@ -359,6 +359,9 @@ def clean_text(
     Untagged reasoning cannot reliably be distinguished from ordinary prose.
     """
     cleaned, _, _ = _clean_with_state(text, _PrefixStripper(known_sender_names))
+    # 只剩 markdown 标记的空壳（如分句后剩下的 "**"）没有可发送内容
+    if is_markup_only(cleaned):
+        return ""
     return cleaned
 
 
@@ -462,16 +465,53 @@ def _is_meta_reply_clause(part: str) -> bool:
     必须要求**整句基本等于**某个短语，而不能只判「含有关键词」——
     否则 ``取消这条回复再帮我查天气`` 这种「元陈述 + 真正要说的话」会被误伤
     （这是实测过的假阳性）。允许最多 2 个字的语气词残留（``不需要插话吧``）。
+
+    判定前先剥掉**包裹用的装饰**（markdown 标记与括号）：
+    实测泄漏样本是 ``*（取消回复）*`` —— 斜体包裹 + 括号括起，
+    不剥的话关键词被标记夹住，长度差超过阈值就漏掉了。
     """
     if not part:
         return False
+    normalized = _strip_decoration(part)
+    if not normalized:
+        return False
     for clause in _META_REPLY_CLAUSES:
-        if part == clause:
+        if normalized == clause:
             return True
-        index = part.find(clause)
-        if index >= 0 and len(part) - len(clause) <= 2:
+        index = normalized.find(clause)
+        if index >= 0 and len(normalized) - len(clause) <= 2:
             return True
     return False
+
+
+#: 包裹用的装饰字符：markdown 强调/代码标记与各类括号
+_DECORATION_CHARS = "*_~`#>-—…· \t\r\n\"'“”‘’（）()「」『』【】[]{}<>《》"
+
+#: 只有这些字符构成的消息是纯标记垃圾（如分句后剩下的 ``**``）。
+#:
+#: **刻意不含反引号**：`` ``` `` 是代码围栏，属于合法内容 —— 分句器会把一个代码块
+#: 切成多段，围栏本身就是其中一段，误删会破坏正文（这个假阳性被现有测试抓到过）。
+#: 也不含标点：`should_drop` 的既有原则是「标点、数字、引号本身可以是正常回复」。
+_MARKUP_ONLY_CHARS = "*_~ \t\r\n"
+
+
+def _strip_decoration(text: str) -> str:
+    """剥掉两端与内部的装饰字符，只留文字本身。"""
+    return str(text or "").strip(_DECORATION_CHARS).strip()
+
+
+def is_markup_only(text: str) -> bool:
+    """整条内容是否只是 markdown 标记/符号，没有任何文字。
+
+    实测来源：分句器会把括号里的内容当「动作描写」剥掉，于是
+    ``*（取消回复）*`` 被切成 ``['**']`` —— 两个孤儿斜体星号发进群，
+    群友当成被屏蔽的脏话。**模型并没有输出这两个星号**，
+    是我们的管线在剥掉内容后留下的空壳，因此必须在发送前丢弃。
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    return all(char in _MARKUP_ONLY_CHARS for char in stripped)
 
 
 def clean_segments(
@@ -492,11 +532,13 @@ def clean_segments(
         #   * sender 的判空条件 ``not (text or segments or images)`` 因 segments 非空为假。
         # 于是 text 路径有 `_clean_text_only` 兜底、分句路径却没有，能正常发出去。
         # 分句同样是「要说的话」，控制词判定必须在这里也生效一次。
-        if is_control_token_only(str(segment or "")) or is_reply_intent_only(
-            str(segment or "")
+        if (
+            is_control_token_only(str(segment or ""))
+            or is_reply_intent_only(str(segment or ""))
+            or is_markup_only(str(segment or ""))
         ):
             continue
         text, depth, fence = _clean_with_state(str(segment or ""), stripper, depth, fence)
-        if text:
+        if text and not is_markup_only(text):
             cleaned.append(text)
     return cleaned
