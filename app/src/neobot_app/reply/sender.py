@@ -21,6 +21,7 @@ from neobot_app.reply.output_guard import (
     clean_segments,
     clean_text,
     is_control_token_only,
+    is_reply_intent_only,
     should_drop,
 )
 from neobot_app.reply.postprocess import process_reply_text
@@ -773,10 +774,12 @@ class ReplySender:
     @staticmethod
     def _clean_text_only(text: str, sender_names: list[str]) -> str:
         original = str(text or "")
-        # 控制词兜底（如正文恰好是 "cancel"）：模型会把工具名当正文写出来，
-        # 而 orchestrator 的「无工具调用但有正文」兜底会把它直接送到这里。
+        # 控制词兜底与「只是关于要不要回复的元陈述」：
+        #   正文恰好是 "cancel"，或整条只是"不需要插话，取消这条回复。"这类
+        #   机器意图（模型不调 cancel 工具、把决定当正文写出来）。
+        # 而 orchestrator 的「无工具调用但有正文」兜底会把它直接送到这里，
         # 归零后由 send_reply 的判空分支丢弃整条，不会发出去。
-        if is_control_token_only(original):
+        if is_control_token_only(original) or is_reply_intent_only(original):
             return ""
         cleaned = clean_text(original, known_sender_names=sender_names)
         if should_drop(original, cleaned, known_sender_names=sender_names):

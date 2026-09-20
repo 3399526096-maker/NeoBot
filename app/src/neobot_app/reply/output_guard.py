@@ -414,6 +414,66 @@ def is_control_token_only(text: str) -> bool:
     return bool(stripped) and stripped.lower() in _CONTROL_TOKENS
 
 
+#: 「关于这条回复本身」的元陈述：模型决定不回复时，有时不调用 cancel 工具，
+#: 而是**把决定当正文写出来**。
+#:
+#: 实测泄漏（群 1107122685，2026-09-20）：
+#:   content == '不需要插话，取消这条回复。'  且 tool_calls == []
+#: 这句被分句器拆成两条发了出去：
+#:   20:48:41 '不需要插话'   /   20:48:43 '取消这条回复'
+#: 与裸 'cancel' 是同一个病根，只是形态为中文句子，`is_control_token_only`
+#: 只认整条英文工具名，因此漏掉。
+_META_REPLY_CLAUSES = (
+    "取消这条回复", "取消本条回复", "取消这次回复", "取消该回复", "取消回复",
+    "不需要插话", "不需要回复", "不用回复", "无需回复", "不必回复",
+    "不需要回", "不需要再说", "无需再说", "不需要继续", "不用继续",
+)
+
+#: 元陈述的分隔符（中文逗号/句号/分号等）
+_META_SPLIT = "，,。.！!？?；;、~～…\n\r\t 　"
+
+
+def is_reply_intent_only(text: str) -> bool:
+    """整条内容是否**只是**关于「要不要回复」的元陈述，而不是回复本身。
+
+    与 `is_control_token_only` 同源、同为「机器词而非要说的话」，区别是形态：
+    前者是裸工具名，后者是中文句子。
+
+    精度取舍同样是**宁可漏拦、不可误伤**：要求**整条由这类短语构成** ——
+    任一分句不是元陈述就整体放行，所以
+    ``取消这条回复再帮我查天气`` / ``你不需要插话我也要说`` 这类正常回复不受影响。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    parts = [
+        part.strip()
+        for part in re.split(f"[{re.escape(_META_SPLIT)}]+", raw)
+        if part.strip()
+    ]
+    if not parts:
+        return False
+    return all(_is_meta_reply_clause(part) for part in parts)
+
+
+def _is_meta_reply_clause(part: str) -> bool:
+    """单个分句是否「就是」一句元陈述。
+
+    必须要求**整句基本等于**某个短语，而不能只判「含有关键词」——
+    否则 ``取消这条回复再帮我查天气`` 这种「元陈述 + 真正要说的话」会被误伤
+    （这是实测过的假阳性）。允许最多 2 个字的语气词残留（``不需要插话吧``）。
+    """
+    if not part:
+        return False
+    for clause in _META_REPLY_CLAUSES:
+        if part == clause:
+            return True
+        index = part.find(clause)
+        if index >= 0 and len(part) - len(clause) <= 2:
+            return True
+    return False
+
+
 def clean_segments(
     segments: list[str] | tuple[str, ...] | None,
     *,
@@ -432,7 +492,9 @@ def clean_segments(
         #   * sender 的判空条件 ``not (text or segments or images)`` 因 segments 非空为假。
         # 于是 text 路径有 `_clean_text_only` 兜底、分句路径却没有，能正常发出去。
         # 分句同样是「要说的话」，控制词判定必须在这里也生效一次。
-        if is_control_token_only(str(segment or "")):
+        if is_control_token_only(str(segment or "")) or is_reply_intent_only(
+            str(segment or "")
+        ):
             continue
         text, depth, fence = _clean_with_state(str(segment or ""), stripper, depth, fence)
         if text:

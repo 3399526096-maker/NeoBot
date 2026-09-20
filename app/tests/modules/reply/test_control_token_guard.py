@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import pytest
 
-from neobot_app.reply.output_guard import clean_segments, is_control_token_only
+from neobot_app.reply.output_guard import (
+    clean_segments,
+    is_control_token_only,
+    is_reply_intent_only,
+)
 from neobot_app.reply.sender import ReplySender
 
 
@@ -95,3 +99,55 @@ def test_segments_still_strip_annotation_prefix() -> None:
     assert clean_segments(["193: AAA大肥鱼: 我是一条鱼"], known_sender_names=["AAA大肥鱼"]) == [
         "我是一条鱼"
     ]
+
+
+# ── 元陈述：模型把「要不要回复」的决定当正文写出来 ─────────────────
+#
+# 实测泄漏（群 1107122685，2026-09-20 20:48）：
+#   content == '不需要插话，取消这条回复。'  且 tool_calls == []
+# 它没调用 cancel 工具，于是被兜底发送、又被分句器拆成两条发进群。
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "不需要插话，取消这条回复。",
+        "取消这条回复",
+        "不需要插话",
+        "取消回复",
+        "不需要回复。",
+        "无需回复，不用回复",
+        "  取消这条回复！！  ",
+    ],
+)
+def test_reply_intent_only_is_detected(text: str) -> None:
+    assert is_reply_intent_only(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "取消这条回复再帮我查天气",          # 含元陈述但更有正文
+        "你不需要插话我也要说",              # 元陈述只是从句
+        "好啊，那就取消订单吧",              # 业务语义，不是元陈述
+        "需要我插话吗",
+        "取消",
+        "",
+        "   ",
+    ],
+)
+def test_intent_guard_does_not_touch_normal_replies(text: str) -> None:
+    assert is_reply_intent_only(text) is False
+
+
+def test_intent_only_segments_are_dropped() -> None:
+    """实测形态：整条元陈述被分句成两条，两条都要丢掉。"""
+    assert clean_segments(["不需要插话", "取消这条回复"]) == []
+
+
+def test_intent_segment_does_not_take_normal_segments_with_it() -> None:
+    assert clean_segments(["不需要插话", "今天天气不错"]) == ["今天天气不错"]
+
+
+def test_sender_drops_intent_only_text() -> None:
+    assert ReplySender._clean_text_only("不需要插话，取消这条回复。", []) == ""
