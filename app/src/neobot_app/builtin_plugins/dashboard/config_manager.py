@@ -1215,6 +1215,10 @@ class EnvFileManager:
                     "required": required,
                     "sensitive": sensitive,
                     "builtin": key in builtin,
+                    # 该键**确实存在于 .env 文件里**（下面 schema 占位项为 False）。
+                    # 面板据此决定是否给「删除」按钮：内置与否不是能不能删的依据——
+                    # 后端 save(deletes=[...]) 对任何文件内的键都支持删除。
+                    "in_file": True,
                     "line": index,
                 }
             )
@@ -1231,6 +1235,7 @@ class EnvFileManager:
                     "required": required,
                     "sensitive": is_sensitive_key(key),
                     "builtin": True,
+                    "in_file": False,
                     "line": 0,
                 }
             )

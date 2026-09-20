@@ -359,6 +359,9 @@ def clean_text(
     Untagged reasoning cannot reliably be distinguished from ordinary prose.
     """
     cleaned, _, _ = _clean_with_state(text, _PrefixStripper(known_sender_names))
+    # 只剩 markdown 标记的空壳（如分句后剩下的 "**"）没有可发送内容
+    if is_markup_only(cleaned):
+        return ""
     return cleaned
 
 
@@ -381,6 +384,136 @@ def should_drop(
     return stripper.is_annotation_only(str(cleaned or ""))
 
 
+#: 控制词：模型偶尔会把**工具名**当成正文写出来。
+#:
+#: 实测形态是 `content == 'cancel'` 且 `tool_calls == []` —— 模型想取消本轮回复，
+#: 却没发起工具调用，于是走了 orchestrator 里「无工具调用但有正文」的兜底发送路径
+#: （`reply/orchestrator.py` 的 `if not tool_calls:` 分支）。那条路径**不经过**
+#: `send_reply` 工具，所以只打在工具层的兜底拦不到它。
+#:
+#: 判定收敛到这里的理由：`_clean_text_only` 是 text 与 segments 两条路径共用的
+#: 清洗出口，任何发送路径都必经此处，是唯一不会漏的地方。
+_CONTROL_TOKENS = frozenset({"cancel"})
+
+#: 两端可能带的引号/括号/句读（`「cancel」`、`cancel。` 都算同一个词）
+_CONTROL_TRIM = (
+    " \t\r\n"
+    "\"'“”‘’「」『』()（）[]【】<>"
+    "。，、.,;；:：!！?？~～-—_…*`"
+)
+
+
+def is_control_token_only(text: str) -> bool:
+    """整条内容是否**恰好**只是一个控制词（如 ``cancel``）。
+
+    精度取舍（宁可漏拦，不可误伤）：
+
+    * **只认整条等值**：``cancel 是什么意思``、``为什么不 cancel`` 这类正常回复不命中；
+    * **只认英文工具名**：不拦「取消」等中文词 —— 对方问「取消吗」答「取消」是正常回复；
+    * 与 ``should_drop`` 的区别：那条要求原文含系统标注，而控制词本身没有标注，
+      所以必须单独判一次。
+    """
+    stripped = str(text or "").strip().strip(_CONTROL_TRIM).strip()
+    return bool(stripped) and stripped.lower() in _CONTROL_TOKENS
+
+
+#: 「关于这条回复本身」的元陈述：模型决定不回复时，有时不调用 cancel 工具，
+#: 而是**把决定当正文写出来**。
+#:
+#: 实测泄漏（群 1107122685，2026-09-20）：
+#:   content == '不需要插话，取消这条回复。'  且 tool_calls == []
+#: 这句被分句器拆成两条发了出去：
+#:   20:48:41 '不需要插话'   /   20:48:43 '取消这条回复'
+#: 与裸 'cancel' 是同一个病根，只是形态为中文句子，`is_control_token_only`
+#: 只认整条英文工具名，因此漏掉。
+_META_REPLY_CLAUSES = (
+    "取消这条回复", "取消本条回复", "取消这次回复", "取消该回复", "取消回复",
+    "不需要插话", "不需要回复", "不用回复", "无需回复", "不必回复",
+    "不需要回", "不需要再说", "无需再说", "不需要继续", "不用继续",
+)
+
+#: 元陈述的分隔符（中文逗号/句号/分号等）
+_META_SPLIT = "，,。.！!？?；;、~～…\n\r\t 　"
+
+
+def is_reply_intent_only(text: str) -> bool:
+    """整条内容是否**只是**关于「要不要回复」的元陈述，而不是回复本身。
+
+    与 `is_control_token_only` 同源、同为「机器词而非要说的话」，区别是形态：
+    前者是裸工具名，后者是中文句子。
+
+    精度取舍同样是**宁可漏拦、不可误伤**：要求**整条由这类短语构成** ——
+    任一分句不是元陈述就整体放行，所以
+    ``取消这条回复再帮我查天气`` / ``你不需要插话我也要说`` 这类正常回复不受影响。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    parts = [
+        part.strip()
+        for part in re.split(f"[{re.escape(_META_SPLIT)}]+", raw)
+        if part.strip()
+    ]
+    if not parts:
+        return False
+    return all(_is_meta_reply_clause(part) for part in parts)
+
+
+def _is_meta_reply_clause(part: str) -> bool:
+    """单个分句是否「就是」一句元陈述。
+
+    必须要求**整句基本等于**某个短语，而不能只判「含有关键词」——
+    否则 ``取消这条回复再帮我查天气`` 这种「元陈述 + 真正要说的话」会被误伤
+    （这是实测过的假阳性）。允许最多 2 个字的语气词残留（``不需要插话吧``）。
+
+    判定前先剥掉**包裹用的装饰**（markdown 标记与括号）：
+    实测泄漏样本是 ``*（取消回复）*`` —— 斜体包裹 + 括号括起，
+    不剥的话关键词被标记夹住，长度差超过阈值就漏掉了。
+    """
+    if not part:
+        return False
+    normalized = _strip_decoration(part)
+    if not normalized:
+        return False
+    for clause in _META_REPLY_CLAUSES:
+        if normalized == clause:
+            return True
+        index = normalized.find(clause)
+        if index >= 0 and len(normalized) - len(clause) <= 2:
+            return True
+    return False
+
+
+#: 包裹用的装饰字符：markdown 强调/代码标记与各类括号
+_DECORATION_CHARS = "*_~`#>-—…· \t\r\n\"'“”‘’（）()「」『』【】[]{}<>《》"
+
+#: 只有这些字符构成的消息是纯标记垃圾（如分句后剩下的 ``**``）。
+#:
+#: **刻意不含反引号**：`` ``` `` 是代码围栏，属于合法内容 —— 分句器会把一个代码块
+#: 切成多段，围栏本身就是其中一段，误删会破坏正文（这个假阳性被现有测试抓到过）。
+#: 也不含标点：`should_drop` 的既有原则是「标点、数字、引号本身可以是正常回复」。
+_MARKUP_ONLY_CHARS = "*_~ \t\r\n"
+
+
+def _strip_decoration(text: str) -> str:
+    """剥掉两端与内部的装饰字符，只留文字本身。"""
+    return str(text or "").strip(_DECORATION_CHARS).strip()
+
+
+def is_markup_only(text: str) -> bool:
+    """整条内容是否只是 markdown 标记/符号，没有任何文字。
+
+    实测来源：分句器会把括号里的内容当「动作描写」剥掉，于是
+    ``*（取消回复）*`` 被切成 ``['**']`` —— 两个孤儿斜体星号发进群，
+    群友当成被屏蔽的脏话。**模型并没有输出这两个星号**，
+    是我们的管线在剥掉内容后留下的空壳，因此必须在发送前丢弃。
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    return all(char in _MARKUP_ONLY_CHARS for char in stripped)
+
+
 def clean_segments(
     segments: list[str] | tuple[str, ...] | None,
     *,
@@ -392,7 +525,20 @@ def clean_segments(
     depth = 0
     fence = None
     for segment in segments or []:
+        # 整条就是控制词（如 "cancel"）的分句直接丢弃。
+        #
+        # 这是实测漏网的**第三条路径**：模型把工具名当正文、且以 segments 形式传入。
+        #   * 工具层兜底要求 ``not segments``，分句形式直接跳过；
+        #   * sender 的判空条件 ``not (text or segments or images)`` 因 segments 非空为假。
+        # 于是 text 路径有 `_clean_text_only` 兜底、分句路径却没有，能正常发出去。
+        # 分句同样是「要说的话」，控制词判定必须在这里也生效一次。
+        if (
+            is_control_token_only(str(segment or ""))
+            or is_reply_intent_only(str(segment or ""))
+            or is_markup_only(str(segment or ""))
+        ):
+            continue
         text, depth, fence = _clean_with_state(str(segment or ""), stripper, depth, fence)
-        if text:
+        if text and not is_markup_only(text):
             cleaned.append(text)
     return cleaned

@@ -22,7 +22,11 @@ from neobot_chat.schema.types import (
 )
 from neobot_chat.tools.toolset import ToolSpec, Toolset
 from neobot_contracts.ports.logging import Logger, NullLogger
-from neobot_app.reply.output_guard import clean_segments, clean_text
+from neobot_app.reply.output_guard import (
+    clean_segments,
+    clean_text,
+    is_control_token_only,
+)
 from neobot_app.reply.postprocess import (
     ReplyPostProcessResult,
     build_over_limit_guidance,
@@ -423,7 +427,10 @@ class ReplyToolExecutor(ToolExecutor):
                 _tool_def(
                     "cancel",
                     "主动结束本轮回复事件。当认为自己不适合参与当前话题、不需要回复、"
-                    "或已通过其他方式完成互动时调用。调用后本轮回复立即结束，不再发送任何消息。",
+                    "或已通过其他方式完成互动时调用。调用后本轮回复立即结束，不再发送任何消息。"
+                    "注意：cancel 是工具名，调用它就等于取消，**不要**先用 send_reply 发送一条"
+                    "内容为 \"cancel\" 的消息，也不要在正文里写出这个词——那会被原样发到群里"
+                    "且无法撤回。",
                     {
                         "properties": {
                             "reason": {
@@ -1597,6 +1604,25 @@ class ReplyToolExecutor(ToolExecutor):
                 "历史消息行首的 \"[msg_id=...]\"、消息编号、发送者名字都是系统标注，"
                 "不是要你模仿的输出格式；请只发送你要说的正文，不要带这些前缀，"
                 "也不要把思考过程/草稿写进正文，然后重新调用 send_reply。"
+            )
+        # 拦住「把 cancel 工具名当正文发出去」。模型常先 send_reply("cancel") 再调用
+        # cancel 工具，而 send_reply 是立即发送、cancel 又撤不回，群里就会多出一条
+        # 莫名其妙的 "cancel"。这里返回**可执行的错误**而不是静默丢弃：模型才知道
+        # 自己没发出去，从而改调 cancel 工具或重写正文。
+        # 注意：这只覆盖工具路径。模型也可能**不调用任何工具**、直接把 "cancel"
+        # 当正文返回（实测 tool_calls=[]），那条路走 orchestrator 的兜底发送，
+        # 由 sender 层的同一条判定兜住（见 output_guard.is_control_token_only）。
+        if (
+            self._cancel is not None
+            and not segments
+            and not args.get("images")
+            and args.get("send_original") is not True
+            and is_control_token_only(text)
+        ):
+            return (
+                "已拦截：正文只有 \"cancel\"，它是工具名、不是要发出去的话——本条未发送。"
+                "想取消本轮回复，请直接调用 cancel 工具（不要先说明、也不要先发一条消息）；"
+                "想正常回复，请把正文改写成你要说的那句话，再调用 send_reply。"
             )
         send_original = bool(args.get("send_original") is True)
         ai_check_approved = bool(args.get("ai_check_approved") is True)

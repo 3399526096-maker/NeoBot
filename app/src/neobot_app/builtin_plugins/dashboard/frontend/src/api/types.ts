@@ -332,6 +332,8 @@ export interface EnvItem {
   builtin?: boolean;
   required?: boolean;
   removed?: boolean;
+  /** 该键确实存在于 .env 文件里（schema 占位项为 false）。只有它为 true 才可删除。 */
+  in_file?: boolean;
   /** 密钥类变量：只写不读 */
   sensitive?: boolean;
   [key: string]: unknown;

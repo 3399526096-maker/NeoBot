@@ -76,6 +76,7 @@ from datetime import datetime, timezone
 from neobot_app.prompt.store import PromptStore, sync_default_prompts
 from neobot_app.runtime.adapter_supervisor import AdapterSupervisor
 from neobot_app.runtime.hot_reload_registry import HotReloadRegistry
+from neobot_app.runtime.process_restart import ProcessRestartSignal
 from neobot_app.runtime.provider_reload import ProviderReloadConsumer
 from neobot_app.skills.balance_guide import sync_balance_query_skill
 
@@ -1536,6 +1537,16 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
 
     # 面板等服务需要读取 application（重启入口）
     register_host_services(plugin["host_facade"], {"application": (application, "应用运行时")})
+
+    # 进程级重启信号：**核心对象**，软重启复用、不随运行时重建。
+    # 待机或重建失败时 application 为 None / 已是停止的旧对象，面板「重启进程」
+    # 打在它上面会被 cli 入口循环忽略（静默空操作）；这个信号与运行时生命周期无关，
+    # 入口循环的运行中与待机两条分支都会检查它。
+    restart_signal = _reuse_or("process_restart", ProcessRestartSignal)
+    register_host_services(
+        plugin["host_facade"],
+        {"process_restart": (restart_signal, "进程重启信号（核心持有，软重启不重建）")},
+    )
 
     # 命令 /reboot:绑定应用重启回调
     if command_service is not None:

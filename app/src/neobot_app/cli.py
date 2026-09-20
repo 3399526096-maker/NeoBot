@@ -72,6 +72,8 @@ async def run() -> bool:
         adapter=get_cached_core("adapter"),
         initial_application=application,
         logger=get_cached_core("logger_factory").get_logger("app.standby"),
+        # 核心持有的进程重启信号：软重启不重建它，待机期也能生效
+        restart_signal=get_cached_core("process_restart"),
     )
     standby_service.set_hooks(
         on_enter=controller.enter,
@@ -85,24 +87,56 @@ async def run() -> bool:
         await plugin_runtime.start_all()
     await controller.start()
     try:
-        while True:
-            runtime = controller.application
-            if runtime is None:
-                if state["stopping"]:
-                    return False
-                # 待机：进程与面板继续存活，等 /reboot 或面板「启动运行」唤醒
-                await asyncio.sleep(0.5)
-                continue
-            state["application"] = runtime
-            await runtime.run_forever()
-            state["application"] = None
-            if runtime.restart_requested:
-                return True
-            if standby_service.is_standby():
-                continue
-            return False
+        return await run_entry_loop(
+            controller=controller,
+            standby_service=standby_service,
+            # 核心持有的进程重启信号（待机期也要检查，否则「重启进程」在待机时是空操作）
+            restart_signal=get_cached_core("process_restart"),
+            state=state,
+        )
     finally:
         state["application"] = None
+
+
+async def run_entry_loop(
+    *,
+    controller: Any,
+    standby_service: Any,
+    restart_signal: Any = None,
+    state: dict[str, Any],
+    poll_interval: float = 0.5,
+) -> bool:
+    """入口循环：跟随当前 bot 运行时，直到该退出进程。
+
+    返回 ``True`` 表示**进程级重启**（调用方据此 execv 自己），``False`` 表示正常退出。
+
+    抽成独立函数是为了能被测试直接驱动 —— 这里的「待机分支也要检查重启信号」
+    是一条回归过的缺陷：待机时 `application` 为 None，若只看运行时自己的
+    `restart_requested`，面板「重启进程」就永远不会被观察到（静默空操作），
+    用户被永久困在待机里。
+    """
+
+    def restart_requested() -> bool:
+        return bool(restart_signal is not None and restart_signal.requested)
+
+    while True:
+        runtime = controller.application
+        if runtime is None:
+            if state.get("stopping"):
+                return False
+            # 待机：进程与面板继续存活，等 /reboot 或面板「启动运行」唤醒
+            if restart_requested():
+                return True
+            await asyncio.sleep(poll_interval)
+            continue
+        state["application"] = runtime
+        await runtime.run_forever()
+        state["application"] = None
+        if runtime.restart_requested or restart_requested():
+            return True
+        if standby_service.is_standby():
+            continue
+        return False
 
 
 def _add_inbound_rule(program: str, port: int) -> bool:

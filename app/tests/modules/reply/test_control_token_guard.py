@@ -1,0 +1,222 @@
+"""控制词与草稿泄漏的回归测试。
+
+两条真实泄漏路径（都有落盘证据）：
+
+* **控制词**：模型把工具名当正文写出来 —— `content == 'cancel'` 且 `tool_calls == []`。
+  它**没有**调用 `send_reply`，走的是 orchestrator 里「无工具调用但有正文」的兜底发送，
+  所以只打在 `send_reply` 工具层的兜底拦不到。现在下沉到 sender 的统一清洗出口。
+* **草稿**：「AI 回复检查」追问之后（该提示词要求模型用工具表态），模型若只回正文，
+  那段正文是它对草稿的斟酌（实测："或者就这句？简短自然"），不是要说的话。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from neobot_app.reply.output_guard import (
+    clean_segments,
+    clean_text,
+    is_control_token_only,
+    is_markup_only,
+    is_reply_intent_only,
+)
+from neobot_app.reply.sender import ReplySender
+
+
+# ── 判定精度：拦得住 cancel，又不误伤正常回复 ──────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["cancel", "CANCEL", " cancel ", "cancel。", "「cancel」", "cancel()", "cancel\n", "  “cancel”  "],
+)
+def test_control_token_detected(text: str) -> None:
+    assert is_control_token_only(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cancel 是什么意思",
+        "为什么不 cancel 呢",
+        "取消",           # 正常中文，可能是真的在回答对方
+        "那我取消吧",
+        "cancelled",
+        "好",
+        "",
+        "   ",
+        "cancel 和 abort 的区别",
+    ],
+)
+def test_normal_text_not_treated_as_control_token(text: str) -> None:
+    assert is_control_token_only(text) is False
+
+
+# ── 发送层兜底：无工具调用的兜底路径也会被拦下 ─────────────────────
+
+
+@pytest.mark.parametrize("text", ["cancel", "CANCEL", "「cancel」", "cancel。"])
+def test_sender_cleans_control_token_to_empty(text: str) -> None:
+    """归零后由 send_reply 的判空分支丢弃整条 —— 这是覆盖所有路径的唯一出口。"""
+    assert ReplySender._clean_text_only(text, []) == ""
+
+
+@pytest.mark.parametrize("text", ["cancel 是什么意思", "取消", "好哦"])
+def test_sender_keeps_normal_text(text: str) -> None:
+    assert ReplySender._clean_text_only(text, []) != ""
+
+
+def test_sender_still_strips_annotation_prefix() -> None:
+    """控制词兜底不能影响既有的标注清洗。
+
+    注意精度：本体**故意**不剥「裸编号」——只有编号后紧跟已知发送者名字时才剥，
+    否则会误伤 `3: 你好` 这类正常回复（见 output_guard 的 `_strip_bare_number`）。
+    """
+    assert ReplySender._clean_text_only("193: AAA大肥鱼: 我是一条鱼", ["AAA大肥鱼"]) == "我是一条鱼"
+
+
+# ── 第三条路径：以 segments 形式传进来的控制词 ─────────────────────
+#
+# 实测漏网：模型把工具名当正文、且以 segments 传入时，两道防线同时失效 ——
+# 工具层兜底要求 `not segments`，sender 的判空条件又因 segments 非空而为假。
+# 因此控制词判定必须在 clean_segments 里也生效。
+
+
+@pytest.mark.parametrize("token", ["cancel", "CANCEL", "「cancel」", "cancel。"])
+def test_control_token_segment_is_dropped(token: str) -> None:
+    assert clean_segments([token]) == []
+
+
+def test_control_token_segment_does_not_take_normal_segments_with_it() -> None:
+    assert clean_segments(["cancel", "真的取消了吗", "好哦"]) == ["真的取消了吗", "好哦"]
+
+
+@pytest.mark.parametrize("text", ["cancel 是什么意思", "取消", "好哦"])
+def test_normal_segments_survive(text: str) -> None:
+    assert clean_segments([text]) == [text]
+
+
+def test_segments_still_strip_annotation_prefix() -> None:
+    """分句路径原有的标注清洗不能被控制词判定影响。"""
+    assert clean_segments(["193: AAA大肥鱼: 我是一条鱼"], known_sender_names=["AAA大肥鱼"]) == [
+        "我是一条鱼"
+    ]
+
+
+# ── 元陈述：模型把「要不要回复」的决定当正文写出来 ─────────────────
+#
+# 实测泄漏（群 1107122685，2026-09-20 20:48）：
+#   content == '不需要插话，取消这条回复。'  且 tool_calls == []
+# 它没调用 cancel 工具，于是被兜底发送、又被分句器拆成两条发进群。
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "不需要插话，取消这条回复。",
+        "取消这条回复",
+        "不需要插话",
+        "取消回复",
+        "不需要回复。",
+        "无需回复，不用回复",
+        "  取消这条回复！！  ",
+    ],
+)
+def test_reply_intent_only_is_detected(text: str) -> None:
+    assert is_reply_intent_only(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "取消这条回复再帮我查天气",          # 含元陈述但更有正文
+        "你不需要插话我也要说",              # 元陈述只是从句
+        "好啊，那就取消订单吧",              # 业务语义，不是元陈述
+        "需要我插话吗",
+        "取消",
+        "",
+        "   ",
+    ],
+)
+def test_intent_guard_does_not_touch_normal_replies(text: str) -> None:
+    assert is_reply_intent_only(text) is False
+
+
+def test_intent_only_segments_are_dropped() -> None:
+    """实测形态：整条元陈述被分句成两条，两条都要丢掉。"""
+    assert clean_segments(["不需要插话", "取消这条回复"]) == []
+
+
+def test_intent_segment_does_not_take_normal_segments_with_it() -> None:
+    assert clean_segments(["不需要插话", "今天天气不错"]) == ["今天天气不错"]
+
+
+def test_sender_drops_intent_only_text() -> None:
+    assert ReplySender._clean_text_only("不需要插话，取消这条回复。", []) == ""
+
+
+# ── '**' 泄漏：分句器剥掉括号内容后留下的孤儿标记 ─────────────────
+#
+# 实测（群 1107122685，2026-09-20 20:51）：
+#   模型 content = '*（取消回复）*'
+#   clean_text  不动它 → 分句结果变成 ['**'] → 两个星号发进群
+#   （群里当成被屏蔽的脏话，bot 随后解释"是手滑打出来的两个星号"）
+# 也就是说 **模型没有输出 '**'**，是我们的管线剥掉内容后留下的空壳。
+
+
+def test_intent_wrapped_in_italic_and_parens_is_detected() -> None:
+    """斜体 + 括号包裹的取消意图也要认出来。"""
+    assert is_reply_intent_only("*（取消回复）*") is True
+    assert is_reply_intent_only("（取消回复）") is True
+    assert is_reply_intent_only("**不需要插话**") is True
+
+
+def test_wrapped_intent_is_dropped_by_sender() -> None:
+    """意图判定在 sender 层（clean_text 只是清洗器，不做发送策略）。
+
+    注意分工：`clean_text` 负责剥标注/思考标签；「这条该不该发」由
+    `ReplySender._clean_text_only` 与 `clean_segments` 决定。
+    """
+    assert ReplySender._clean_text_only("*（取消回复）*", []) == ""
+
+
+def test_splitter_output_of_wrapped_intent_is_dropped() -> None:
+    """实测链路：分句器把 '*（取消回复）*' 切成 ['**']，这个空壳必须被丢掉。
+
+    这是 '**' 发进群的直接原因 —— 模型并没有输出这两个星号。
+    """
+    from neobot_app.reply.postprocess import process_reply_text
+
+    result = process_reply_text(
+        "*（取消回复）*", bot_name="x", max_length=500, max_sentence_count=10
+    )
+    assert result.messages == ["**"]          # 分句器的现状（保留现状，不在此处改）
+    assert clean_segments(result.messages) == []   # 但发送前会被清空
+
+
+def test_wrapped_intent_segment_is_dropped() -> None:
+    assert clean_segments(["*（取消回复）*", "真的取消了吗"]) == ["真的取消了吗"]
+
+
+@pytest.mark.parametrize("text", ["**", "*", "__", "~~", "  **  ", "***"])
+def test_markup_only_text_is_dropped(text: str) -> None:
+    assert is_markup_only(text) is True
+    assert clean_text(text) == ""
+
+
+@pytest.mark.parametrize("text", ["```", "```text", "---", "。", "1"])
+def test_fences_and_punctuation_are_not_treated_as_markup(text: str) -> None:
+    """代码围栏与标点必须保留。
+
+    `` ``` `` 是代码块的分隔符，分句器会把一个代码块切成多段、围栏自成一段；
+    误删会破坏正文。标点/数字同理（`should_drop` 的既有原则）。
+    这个假阳性是被现有测试 test_output_guard_followup 抓出来的。
+    """
+    assert is_markup_only(text) is False
+
+
+@pytest.mark.parametrize("text", ["*你好呀*", "**重点**", "好哦", "a*b"])
+def test_text_with_markup_is_kept(text: str) -> None:
+    """有文字就必须保留 —— 不能让防标记垃圾的判断误伤正常 markdown。"""
+    assert is_markup_only(text) is False
+    assert clean_text(text) == text

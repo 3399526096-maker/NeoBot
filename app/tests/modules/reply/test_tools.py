@@ -36,6 +36,95 @@ def _make_executor(**overrides) -> ReplyToolExecutor:
     return ReplyToolExecutor(**overrides)
 
 
+# ── cancel 被当成正文发出去（回归）────────────────────────────────
+#
+# 背景：模型想取消本轮回复时，会先 send_reply("cancel") 再调用 cancel 工具。
+# send_reply 是**立即发送**的、cancel 又撤不回，群里就会先冒出一条内容为
+# "cancel" 的消息。这里守住「正文恰好是 cancel 时不发送」这条兜底。
+
+
+async def test_send_reply_blocks_bare_cancel_token() -> None:
+    delivered: list[dict] = []
+
+    async def handler(**kwargs):
+        delivered.append(kwargs)
+
+    executor = _make_executor(
+        send_reply_handler=handler, cancel_handler=lambda reason=None: None
+    )
+    result = await executor.execute("send_reply", {"text": "cancel"})
+
+    assert not delivered, "正文只有 cancel 时不应真的发送"
+    assert "未发送" in result
+
+
+@pytest.mark.parametrize(
+    "text", ["cancel", "CANCEL", " cancel ", "cancel。", "「cancel」", "cancel()"]
+)
+async def test_send_reply_blocks_cancel_variants(text: str) -> None:
+    """两端带引号/括号/句读的 cancel 同样要拦住。"""
+    delivered: list[dict] = []
+
+    async def handler(**kwargs):
+        delivered.append(kwargs)
+
+    executor = _make_executor(
+        send_reply_handler=handler, cancel_handler=lambda reason=None: None
+    )
+    await executor.execute("send_reply", {"text": text})
+    assert not delivered, f"{text!r} 应当被拦下"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cancel 是什么意思",
+        "为什么不 cancel 呢",
+        "取消",  # 正常中文，可能是真的在回答对方
+        "那我取消吧",
+        "cancelled",
+    ],
+)
+async def test_send_reply_keeps_normal_text_mentioning_cancel(text: str) -> None:
+    """含 cancel 的正常回复绝不能被误伤（精度优先于召回）。"""
+    delivered: list[dict] = []
+
+    async def handler(**kwargs):
+        delivered.append(kwargs)
+
+    executor = _make_executor(
+        send_reply_handler=handler, cancel_handler=lambda reason=None: None
+    )
+    await executor.execute("send_reply", {"text": text})
+    assert delivered, f"{text!r} 是正常回复，不应被拦"
+
+
+async def test_send_reply_cancel_guard_inactive_without_cancel_tool() -> None:
+    """没有注册 cancel 工具的部署不该受影响（`self._cancel is None`）。"""
+    delivered: list[dict] = []
+
+    async def handler(**kwargs):
+        delivered.append(kwargs)
+
+    executor = _make_executor(send_reply_handler=handler)
+    await executor.execute("send_reply", {"text": "cancel"})
+    assert delivered, "未注册 cancel 工具时应原样放行"
+
+
+async def test_send_reply_cancel_guard_allows_explicit_send_original() -> None:
+    """`send_original=true` 是用户的明确指令，放行。"""
+    delivered: list[dict] = []
+
+    async def handler(**kwargs):
+        delivered.append(kwargs)
+
+    executor = _make_executor(
+        send_reply_handler=handler, cancel_handler=lambda reason=None: None
+    )
+    await executor.execute("send_reply", {"text": "cancel", "send_original": True})
+    assert delivered, "send_original=true 时不应被拦"
+
+
 # ── send_reply 参数校验 ──────────────────────────────────────────
 
 
