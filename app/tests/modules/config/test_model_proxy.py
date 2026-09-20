@@ -57,9 +57,21 @@ def test_registered_model_threads_flag_into_provider() -> None:
 
 
 def test_register_models_passes_proxy_flag(monkeypatch) -> None:
-    from neobot_app.config.loader.manager import Config
+    import dataclasses
 
-    config = BotConfig()
+    from neobot_app.config.loader.manager import Config
+    from neobot_app.config.schemas.bot import ModelAssignments, _example_models
+
+    # 出厂默认模型库为空（新用户在面板里自行导入），必须显式装配；
+    # 同时要分配角色 —— register_models 是按 [models.assignments] 引用的 key 注册的。
+    config = dataclasses.replace(
+        BotConfig(),
+        models=dataclasses.replace(
+            BotConfig().models,
+            registry=_example_models(),
+            assignments=ModelAssignments(primary_chat_model="deepseek-v4-pro"),
+        ),
+    )
     entry = config.models.get("deepseek-v4-pro")
     assert entry is not None
     entry.use_system_proxy = True

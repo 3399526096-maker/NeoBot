@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -8,8 +9,13 @@ import pytest
 import tomlkit
 
 from neobot_app.bootstrap import _pipeline
+from neobot_app.config.loader.converter import dataclass_to_toml
 from neobot_app.config.loader.manager import Config, ConfigLoadError
-from neobot_app.config.schemas.bot import BotConfig
+from neobot_app.config.schemas.bot import (
+    BotConfig,
+    ModelAssignments,
+    _example_models,
+)
 from neobot_chat import get_model_registry
 
 _DEEPSEEK_KEYS = {
@@ -47,8 +53,35 @@ def _clear_platform_env(monkeypatch) -> None:
 
 
 def _write_minimal_config(tmp_path) -> Path:
+    """写一份最小配置，但**显式带上模型库与角色分配**。
+
+    出厂默认模型库现在是空的（见 `schemas/bot.py` 的 `_default_model_library`：
+    新用户自行在面板里导入模型）。而这一组测试要验证的是「平台的 Key 是否可用 →
+    对应的模型是否被注册」，配置里没有任何模型就无从谈起 —— 那样测到的不是可用性
+    逻辑，而是"空库"这一事实。所以这里显式把示例模型写进配置。
+    """
+    config = dataclasses.replace(
+        BotConfig(),
+        bot=dataclasses.replace(BotConfig().bot, account=10001),
+        models=dataclasses.replace(
+            BotConfig().models,
+            registry=_example_models(),
+            assignments=ModelAssignments(
+                primary_chat_model="deepseek-v4-pro",
+                agent_model_1="deepseek-v4-flash-max",
+                agent_model_2="deepseek-v4-flash-high",
+                agent_model_3="deepseek-v4-flash-off",
+                vision_model="qwen3-vl-8b",
+                tts_model="cosyvoice2",
+                creator_image_models=["flux-schnell"],
+            ),
+        ),
+    )
+    # 注意：dataclass_to_toml 的第一个参数是**类型**，默认值取 field.default_factory；
+    # 想让它写出实例里的值，必须走 existing_data 这条路（传 dict）。
+    doc, _, _ = dataclass_to_toml(BotConfig, dataclasses.asdict(config), is_root=True)
     cfg_path = tmp_path / "bot.toml"
-    cfg_path.write_text('[bot]\naccount = 10001\n\n[chat]\n', encoding="utf-8")
+    cfg_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
     return cfg_path
 
 
@@ -284,7 +317,15 @@ def test_load_only_deepseek_key_registers_chat_models_with_details(monkeypatch, 
         'provider = "DeepSeek"\n'
         'model_name = "deepseek-v4-flash"\n'
         "[models.registry.settings]\n"
-        'deepseek_thinking_mode = "disabled"\n',
+        'deepseek_thinking_mode = "disabled"\n'
+        "\n"
+        # 必须显式分配角色：模型注册是按 [models.assignments] 里引用的 key 进行的，
+        # 出厂默认分配现在是空的（新用户在面板里自行分配），不写这里就一个都注册不出来。
+        "[models.assignments]\n"
+        'primary_chat_model = "deepseek-v4-pro"\n'
+        'agent_model_1 = "deepseek-v4-flash-max"\n'
+        'agent_model_2 = "deepseek-v4-flash-high"\n'
+        'agent_model_3 = "deepseek-v4-flash-off"\n',
         encoding="utf-8",
     )
 

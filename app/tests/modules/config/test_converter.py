@@ -191,8 +191,10 @@ def test_dict_to_dataclass_nested_structure_and_subclass_detection():
     assert primary.settings.deepseek_thinking_mode == "random"
     assert primary.settings.deepseek_reasoning_effort == "max"
     assert primary.pricing.input_price_per_mtokens == 0.0
-    # 调用方只引用 key，未在 registry 里出现的默认条目不应被隐式保留
-    assert models.assignments.primary_chat_model == "deepseek-v4-pro"
+    # 调用方只引用 key，未在 registry 里出现的默认条目不应被隐式保留。
+    # 角色分配同理：出厂默认分配为空（新用户在面板里自行分配），而 raw 里没写
+    # assignments，所以这里必须是空串 —— 若取到某个模型 key，反而说明有隐藏默认值泄漏。
+    assert models.assignments.primary_chat_model == ""
     assert [item.key for item in models.registry] == ["deepseek-v4-pro"]
 
 

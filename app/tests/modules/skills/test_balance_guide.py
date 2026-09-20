@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
-from neobot_app.config.schemas.bot import BotConfig
+from neobot_app.config.schemas.bot import BotConfig, _example_models
 from neobot_app.skills.balance_guide import (
     NO_HINT_NOTE,
     build_balance_query_document,
     sync_balance_query_skill,
 )
+
+
+def _configured_config() -> BotConfig:
+    """显式装配模型库。
+
+    出厂默认模型库现在是空的（见 `schemas/bot.py` 的 `_default_model_library`：
+    新用户在面板里自行导入模型），所以测试不能再指望 ``BotConfig()`` 自带模型。
+    """
+    config = BotConfig()
+    return dataclasses.replace(
+        config,
+        models=dataclasses.replace(config.models, registry=_example_models()),
+    )
 
 
 class FakeRegistry:
@@ -24,7 +38,7 @@ class FakeRegistry:
 
 
 def test_document_only_lists_models_with_hint() -> None:
-    config = BotConfig()
+    config = _configured_config()
     primary = config.models.get("deepseek-v4-pro")
     assert primary is not None
     primary.balance_query_hint = "GET https://api.example.com/user/balance，Authorization: Bearer <key>"
@@ -49,7 +63,7 @@ def test_document_without_any_hint_still_contains_note() -> None:
 
 
 def test_sync_writes_file_and_registers_skill(tmp_path: Path) -> None:
-    config = BotConfig()
+    config = _configured_config()
     vision = config.models.get("qwen3-vl-8b")
     assert vision is not None
     vision.balance_query_hint = "GET https://vision.example.com/balance"

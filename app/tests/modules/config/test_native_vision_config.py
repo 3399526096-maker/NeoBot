@@ -10,7 +10,12 @@ from neobot_app.config.loader.converter import dataclass_to_toml, dict_to_datacl
 
 from neobot_app.bootstrap import _providers
 from neobot_app.config.loader.manager import Config
-from neobot_app.config.schemas.bot import BotConfig, ModelRegistration
+from neobot_app.config.schemas.bot import (
+    BotConfig,
+    ModelAssignments,
+    ModelRegistration,
+    _example_models,
+)
 from neobot_chat import get_model_registry
 from neobot_chat.providers.native_vision import NativeVisionFallbackProvider
 
@@ -36,8 +41,35 @@ def _library_entry(config: BotConfig, key: str):
     return definition
 
 
-def test_native_vision_defaults():
+def _configured_config() -> BotConfig:
+    """测试用配置：**显式**装上模型库与角色分配。
+
+    出厂默认模型库现在是空的（见 `schemas/bot.py` 的 `_default_model_library`：
+    新用户自行在面板里导入模型），所以测试不能再指望 ``BotConfig()`` 自带模型。
+    显式装配也更贴近真实用法 —— 只有用户配过的配置里才有模型。
+    """
+    # 注意：这里必须是裸的 BotConfig()，不能再调 _configured_config()（会自递归）
     config = BotConfig()
+    return dataclasses.replace(
+        config,
+        models=dataclasses.replace(
+            config.models,
+            registry=_example_models(),
+            assignments=ModelAssignments(
+                primary_chat_model=PRIMARY_KEY,
+                agent_model_1="deepseek-v4-flash-max",
+                agent_model_2="deepseek-v4-flash-high",
+                agent_model_3="deepseek-v4-flash-off",
+                vision_model=VISION_KEY,
+                tts_model="cosyvoice2",
+                creator_image_models=["flux-schnell"],
+            ),
+        ),
+    )
+
+
+def test_native_vision_defaults():
+    config = _configured_config()
     # 数据类层面的默认值保持 False：旧配置与外部脚本不受影响
     assert ModelRegistration().native_vision is False
     # 但默认模型库里的对话模型已声明原生视觉（deepseek-flash）
@@ -56,7 +88,7 @@ def test_native_vision_defaults():
 def test_config_registration_passes_native_vision(monkeypatch):
     monkeypatch.setenv("DeepSeek_URL", "https://api.deepseek.com")
     monkeypatch.setenv("DeepSeek_APIKey", "test-key")
-    config = BotConfig()
+    config = _configured_config()
     primary = _library_entry(config, PRIMARY_KEY)
     primary.native_vision = True
     primary.model_name = "deepseek-v4-flash-vision-exp"
@@ -78,7 +110,7 @@ def test_config_registration_passes_native_vision(monkeypatch):
 
 async def test_bootstrap_wraps_main_with_vision_model_fallback(monkeypatch):
     """主模型声明原生视觉时，回退路由固定为视觉模型（按分配 key 解析）。"""
-    config = BotConfig()
+    config = _configured_config()
     config.agent_model.main_agent = 2
     _library_entry(config, "deepseek-v4-flash-high").native_vision = True
     created = []
@@ -99,7 +131,7 @@ async def test_bootstrap_wraps_main_with_vision_model_fallback(monkeypatch):
 @pytest.mark.parametrize("failure", ["creation", "capability"])
 async def test_unavailable_primary_falls_back_to_vision_model(monkeypatch, failure):
     """主模型不可用（创建失败或无视觉能力）时自动切换到视觉模型，图片照常发送。"""
-    config = BotConfig()
+    config = _configured_config()
     _library_entry(config, PRIMARY_KEY).native_vision = True
 
     def create(name):
@@ -125,7 +157,7 @@ async def test_unavailable_primary_falls_back_to_vision_model(monkeypatch, failu
 
 
 def test_nonvision_main_does_not_create_fallback(monkeypatch):
-    config = BotConfig()
+    config = _configured_config()
     # 默认主模型已声明原生视觉；这里显式关掉以覆盖"非视觉主模型"分支
     _library_entry(config, PRIMARY_KEY).native_vision = False
     create = Mock(return_value=FakeProvider())
@@ -138,7 +170,7 @@ def test_nonvision_main_does_not_create_fallback(monkeypatch):
 
 def test_unavailable_vision_fallback_is_startup_error(monkeypatch):
     """视觉模型也不可用时，仍按启动错误处理（给出明确提示而不是崩溃）。"""
-    config = BotConfig()
+    config = _configured_config()
     _library_entry(config, PRIMARY_KEY).native_vision = True
     create = Mock(side_effect=ValueError("missing key"))
     monkeypatch.setattr(_providers, "create_provider", create)
@@ -149,7 +181,7 @@ def test_unavailable_vision_fallback_is_startup_error(monkeypatch):
 
 async def test_unavailable_nonvision_main_falls_back_to_vision_model(monkeypatch):
     """非视觉主模型创建失败时，自动回退到视觉模型而不是报错停机。"""
-    config = BotConfig()
+    config = _configured_config()
     _library_entry(config, PRIMARY_KEY).native_vision = False
 
     def create(name):

@@ -523,7 +523,25 @@ def _default_creator_image_model() -> "ModelDefinition":
 
 
 def _default_model_library() -> "List[ModelDefinition]":
-    """默认模型库：模型单独存储，调用方只引用 key。"""
+    """默认模型库：**出厂为空**。
+
+    刻意不预置任何模型。原因：新用户第一次打开面板时，应当看到一个干净的模型库，
+    由他自己导入供应商与模型；预置的 7 个模型（deepseek / 硅基流动 / FLUX / CosyVoice…）
+    对新用户来说全是「别人的东西」——没有对应的 API Key、URL 也不一定适用，
+    却要先在一堆不属于自己的条目里找出哪些该删。
+
+    接入路径已经完全在网页面板里（环境变量 → 模型库 → 模型分配），
+    或以面板里的「新手教程」向导逐步完成，因此不需要靠预置条目做示例。
+
+    .. note::
+       下面的 `_default_*` 工厂函数保留下来作为**示例模板**（面板向导与文档引用它们的
+       字段形状），但**不再**被本函数收集为默认值。
+    """
+    return []
+
+
+def _example_models() -> "List[ModelDefinition]":
+    """示例模型集合（仅供面板向导 / 文档参考，不作为出厂默认库）。"""
     return [
         _default_primary_chat_model(),
         _default_agent_model_1(),
@@ -540,31 +558,31 @@ class ModelAssignments:
     """各调用方引用的模型 key（在模型库 [models.registry] 中定义）。"""
 
     primary_chat_model: str = field(
-        default="deepseek-v4-pro",
+        default="",
         metadata={"description": "Agent模型编号0（主对话模型）引用的模型 key"},
     )
     agent_model_1: str = field(
-        default="deepseek-v4-flash-max",
+        default="",
         metadata={"description": "Agent模型编号1引用的模型 key"},
     )
     agent_model_2: str = field(
-        default="deepseek-v4-flash-high",
+        default="",
         metadata={"description": "Agent模型编号2引用的模型 key"},
     )
     agent_model_3: str = field(
-        default="deepseek-v4-flash-off",
+        default="",
         metadata={"description": "Agent模型编号3引用的模型 key"},
     )
     vision_model: str = field(
-        default="qwen3-vl-8b",
+        default="",
         metadata={"description": "图像识别模型引用的模型 key"},
     )
     tts_model: str = field(
-        default="cosyvoice2",
+        default="",
         metadata={"description": "语音模型引用的模型 key"},
     )
     creator_image_models: List[str] = field(
-        default_factory=lambda: ["flux-schnell"],
+        default_factory=list,
         metadata={
             "description": "创作者Agent生图模型列表（引用 key）；配置多个时由 Agent 按描述自行选择"
         },

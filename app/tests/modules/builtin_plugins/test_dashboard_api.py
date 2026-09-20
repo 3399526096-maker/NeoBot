@@ -174,6 +174,27 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+#: 面板测试用的模型段（追加到最小配置之后）。
+#:
+#: 出厂默认模型库是空的（新用户在面板里自行导入模型），所以测试必须显式声明
+#: 自己用到的模型与角色分配 —— 否则模型库视图为空、「测试连通性」也会把
+#: 任何 key 当成未知模型返回 404。
+_EXAMPLE_MODELS_TOML = """
+[[models.registry]]
+key = "deepseek-v4-pro"
+description = "主对话模型（Agent模型编号0）"
+provider = "DeepSeek"
+model_name = "deepseek-v4-pro"
+
+[models.registry.settings]
+deepseek_thinking_mode = "enabled"
+deepseek_reasoning_effort = "max"
+
+[models.assignments]
+primary_chat_model = "deepseek-v4-pro"
+"""
+
+
 async def _start_panel(
     tmp_path: Path,
     *,
@@ -182,7 +203,13 @@ async def _start_panel(
     services=None,
 ):
     config_path = tmp_path / "config.toml"
-    config_path.write_text('version = "0.6.0"\n', encoding="utf-8")
+    # 出厂默认模型库现在是空的（见 schemas/bot.py 的 _default_model_library：
+    # 新用户自行在面板里导入模型）。而「模型库视图」「测试连通性」这些接口必须有模型
+    # 才能验证，所以这里显式追加一段模型配置。只追加模型段、不动其余内容，
+    # 以免影响本文件其它依赖最小配置的用例。
+    config_path.write_text(
+        'version = "0.6.0"\n' + _EXAMPLE_MODELS_TOML, encoding="utf-8"
+    )
     env_path = tmp_path / ".env"
     env_path.write_text("DeepSeek_APIKey=sk-super-secret\n", encoding="utf-8")
 

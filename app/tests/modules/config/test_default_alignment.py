@@ -89,12 +89,27 @@ def test_self_heal_defaults_to_strong_reasoning_model() -> None:
     """自修复默认必须指向强推理模型：它要读日志、定位缺陷并改代码，
     弱模型/非推理模型只会反复试错。默认编号 1 = 推理强度 max 的 Agent 模型。"""
     from neobot_app.assembly.agents import resolve_agent_model_name
-    from neobot_app.config.schemas.bot import AgentModelRouting, Models
+    from neobot_app.config.schemas.bot import (
+        AgentModelRouting,
+        ModelAssignments,
+        Models,
+        _example_models,
+    )
 
     routing = AgentModelRouting()
     assert routing.self_heal == 1
 
-    models = Models()
+    # 出厂默认模型库与角色分配都是空的（新用户自行在面板导入并分配），
+    # 因此这里必须显式装配，才能测「角色 → 模型」的解析。
+    models = Models(
+        registry=_example_models(),
+        assignments=ModelAssignments(
+            primary_chat_model="deepseek-v4-pro",
+            agent_model_1="deepseek-v4-flash-max",
+            agent_model_2="deepseek-v4-flash-high",
+            agent_model_3="deepseek-v4-flash-off",
+        ),
+    )
     config = SimpleNamespace(agent_model=routing, models=models)
     key = resolve_agent_model_name(config, "self_heal", default_index=1)
 

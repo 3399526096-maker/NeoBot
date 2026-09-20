@@ -660,6 +660,11 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
     from neobot_app.runtime.standby_service import StandbyService
 
     standby_cfg = getattr(config, "standby", None)
+    # 「模型未接入」与「配置缺失」都属于「还不能干活」，一并按启动即待机处理：
+    # 出厂模型库是空的（新用户要先在面板里接入供应商与模型），此时若照常连上 QQ，
+    # 机器人会对每一条消息都回「主回复模型不可用」，既吵又难定位。
+    # 停在待机、面板可用、写清原因，用户接好模型后点「软重启运行」即可。
+    models_pending = _models_not_configured(config)
     standby_service = _reuse_or(
         "standby_service",
         lambda: StandbyService(
@@ -668,12 +673,18 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
             connect_onebot=bool(getattr(standby_cfg, "connect_onebot", True)),
             # 配置缺失时强制「启动即待机」：用默认配置把面板拉起来修配置
             start_in_standby=bool(_CONFIG_ERROR)
+            or models_pending
             or bool(getattr(standby_cfg, "start_in_standby", False)),
         ),
     )
     if _CONFIG_ERROR:
         standby_service.set_startup_reason(
             f"配置缺失，已进入待机等待修复：{_CONFIG_ERROR}"
+        )
+    elif models_pending:
+        standby_service.set_startup_reason(
+            "尚未接入模型：请在面板「模型库」中配置主对话模型"
+            "（可点右上角「教程」查看三步接入流程），完成后点「软重启运行」"
         )
 
     # ── 字符级缓存命中计算器(成本管线;仅聊天管线接入) ──
@@ -1533,3 +1544,29 @@ def create_application(*, owns_plugins: bool = True) -> NeoBotApplication:
             command_service.set_restart_callback(restart)
 
     return application
+
+
+def _models_not_configured(config: Any) -> bool:
+    """模型是否**尚未接入**（出厂状态）。
+
+    判定两条，任一成立即视为未接入：
+
+    * 模型库为空 —— 出厂配置刻意不预置任何模型，用户要在面板里自行导入；
+    * 主对话模型未分配 —— 库里有模型却没指定主模型，同样没法干活。
+
+    这与「配置缺失」的区别：配置缺失是文件坏了/必需项没写（``_CONFIG_ERROR``），
+    而这里是**一张白纸的起始状态**。两者的处置相同（启动即待机、面板可用），
+    但给用户看的原因不同——后者应当是引导，而不是报错。
+    """
+    models = getattr(config, "models", None)
+    if models is None:
+        return True
+    if not (getattr(models, "registry", None) or []):
+        return True
+    assignments = getattr(models, "assignments", None)
+    primary = (
+        str(getattr(assignments, "primary_chat_model", "") or "").strip()
+        if assignments is not None
+        else ""
+    )
+    return not primary

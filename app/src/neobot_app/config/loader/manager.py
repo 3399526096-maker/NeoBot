@@ -602,6 +602,21 @@ class Config:
             schema, existing_data if file_exists else None, is_root=True
         )
 
+        # 模型库为空时，「角色未配置」不是错误，而是「尚未接入模型」的初始状态。
+        # 出厂配置刻意不带任何模型（见 schemas/bot.py 的 _default_model_library），
+        # 新用户要先在面板里接入供应商与模型。此时若把 7 个角色分配报成「缺失必须项」，
+        # 新用户一打开就看到十几条红字，会以为配置坏了 —— 而它正是预期的起点。
+        # 注意：只有当**模型库确实为空**时才这样分流；库里有模型却没分配角色，
+        # 仍然是配置错误，必须照旧报出来。
+        missing_required, pending_model_roles = _split_pending_model_roles(
+            missing_required, schema
+        )
+        if pending_model_roles:
+            logger.info(
+                "尚未接入模型：模型库为空，以下角色待用户在面板中配置 -> "
+                + ", ".join(pending_model_roles)
+            )
+
         # 只在首次生成或有缺失项时写入文件
         should_write = not file_exists or missing_required or missing_optional
 
@@ -653,3 +668,40 @@ class Config:
         except Exception as e:
             logger.error(f"解析配置文件失败: {e}")
             raise
+
+
+def _split_pending_model_roles(
+    missing_required: list[Any],
+    schema: Any,
+) -> tuple[list[Any], list[str]]:
+    """把「模型库为空时的角色未配置」从「缺失必须项」里摘出来。
+
+    出厂配置的模型库是空的（用户在面板里自行接入），此时 `models.assignments.*`
+    必然全部为空 —— 那是**尚未配置**，不是**配置错误**。两者混在一起上报会让新用户
+    一打开就看到十几条红字。
+
+    返回 ``(仍然是真正缺失的必须项, 待配置的角色路径)``。
+
+    兼容写法：条目既可能是 ``"models.assignments.primary_chat_model"`` 这样的完整路径，
+    也可能在别的层级传进来，因此用后缀判断而不是前缀。
+    """
+    models = getattr(schema, "models", None)
+    registry = getattr(models, "registry", None) or []
+    if registry:
+        # 库里有模型：角色没配就是实打实的配置错误，原样返回
+        return list(missing_required), []
+
+    kept: list[Any] = []
+    pending: list[str] = []
+    for field in missing_required:
+        text = str(field)
+        # models.registry 本身就是「空的」——出厂刻意不预置模型，
+        # 报它缺失同样属于噪音，与角色一起归入「尚未接入」。
+        if (
+            text in ("models.registry", "models.assignments")
+            or text.startswith("models.assignments.")
+        ):
+            pending.append(text)
+        else:
+            kept.append(field)
+    return kept, pending
