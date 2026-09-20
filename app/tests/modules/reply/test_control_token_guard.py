@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from neobot_app.reply.output_guard import is_control_token_only
+from neobot_app.reply.output_guard import clean_segments, is_control_token_only
 from neobot_app.reply.sender import ReplySender
 
 
@@ -67,3 +67,31 @@ def test_sender_still_strips_annotation_prefix() -> None:
     否则会误伤 `3: 你好` 这类正常回复（见 output_guard 的 `_strip_bare_number`）。
     """
     assert ReplySender._clean_text_only("193: AAA大肥鱼: 我是一条鱼", ["AAA大肥鱼"]) == "我是一条鱼"
+
+
+# ── 第三条路径：以 segments 形式传进来的控制词 ─────────────────────
+#
+# 实测漏网：模型把工具名当正文、且以 segments 传入时，两道防线同时失效 ——
+# 工具层兜底要求 `not segments`，sender 的判空条件又因 segments 非空而为假。
+# 因此控制词判定必须在 clean_segments 里也生效。
+
+
+@pytest.mark.parametrize("token", ["cancel", "CANCEL", "「cancel」", "cancel。"])
+def test_control_token_segment_is_dropped(token: str) -> None:
+    assert clean_segments([token]) == []
+
+
+def test_control_token_segment_does_not_take_normal_segments_with_it() -> None:
+    assert clean_segments(["cancel", "真的取消了吗", "好哦"]) == ["真的取消了吗", "好哦"]
+
+
+@pytest.mark.parametrize("text", ["cancel 是什么意思", "取消", "好哦"])
+def test_normal_segments_survive(text: str) -> None:
+    assert clean_segments([text]) == [text]
+
+
+def test_segments_still_strip_annotation_prefix() -> None:
+    """分句路径原有的标注清洗不能被控制词判定影响。"""
+    assert clean_segments(["193: AAA大肥鱼: 我是一条鱼"], known_sender_names=["AAA大肥鱼"]) == [
+        "我是一条鱼"
+    ]

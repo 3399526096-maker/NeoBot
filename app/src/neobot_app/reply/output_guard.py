@@ -425,6 +425,15 @@ def clean_segments(
     depth = 0
     fence = None
     for segment in segments or []:
+        # 整条就是控制词（如 "cancel"）的分句直接丢弃。
+        #
+        # 这是实测漏网的**第三条路径**：模型把工具名当正文、且以 segments 形式传入。
+        #   * 工具层兜底要求 ``not segments``，分句形式直接跳过；
+        #   * sender 的判空条件 ``not (text or segments or images)`` 因 segments 非空为假。
+        # 于是 text 路径有 `_clean_text_only` 兜底、分句路径却没有，能正常发出去。
+        # 分句同样是「要说的话」，控制词判定必须在这里也生效一次。
+        if is_control_token_only(str(segment or "")):
+            continue
         text, depth, fence = _clean_with_state(str(segment or ""), stripper, depth, fence)
         if text:
             cleaned.append(text)
